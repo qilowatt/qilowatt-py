@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "setuptools_scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qilowatt"
+dynamic = ["version"]
+description = "Communication package for Qilowatt inverters"
+readme = "README.md"
+readme-content-type = "text/markdown"
+requires-python = ">=3.7"
+license = { text = "MIT" }
+authors = [
+    { name = "Tanel Vakker", email = "tanel@vakker.org" }
+]
+keywords = ["mqtt", "qilowatt", "inverter", "energy", "home-assistant"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Home Automation",
+    "Topic :: Software Development :: Libraries",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "paho-mqtt>=1.6.1",
+    "getmac>=0.8.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/qilowatt/qilowatt-py"
+Documentation = "https://github.com/qilowatt/qilowatt-py#readme"
+Bug Tracker = "https://github.com/qilowatt/qilowatt-py/issues"
+Source Code = "https://github.com/qilowatt/qilowatt-py"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools_scm]
+version_scheme = "post-release"
+local_scheme = "no-local-version"
