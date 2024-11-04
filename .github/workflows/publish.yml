@@ -8,10 +8,11 @@ on:
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
-
+    environment: release
     permissions:
       contents: read  # For actions/checkout
       packages: write  # For publishing to PyPI
+      id-token: write
 
     steps:
       - name: Checkout code
@@ -31,12 +32,8 @@ jobs:
         run: |
           python -m build --sdist --wheel
 
-      - name: Publish package to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          python -m twine upload dist/*
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
 
       - name: Confirm success
         run: echo "Package published successfully!"
