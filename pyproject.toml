@@ -36,8 +36,8 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/qilowatt/qilowatt-py"
 Documentation = "https://github.com/qilowatt/qilowatt-py#readme"
-Bug Tracker = "https://github.com/qilowatt/qilowatt-py/issues"
-Source Code = "https://github.com/qilowatt/qilowatt-py"
+Issues = "https://github.com/qilowatt/qilowatt-py/issues"
+Repository = "https://github.com/qilowatt/qilowatt-py"
 
 [tool.setuptools.packages.find]
 where = ["src"]
