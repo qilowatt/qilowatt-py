@@ -42,7 +42,7 @@ class QilowattMQTTClient:
         self._sensor_topic = f"Q/{self.inverter_id}/SENSOR"
         self._state_topic = f"Q/{self.inverter_id}/STATE"
         self._status0_topic = f"Q/{self.inverter_id}/STATUS0"
-        self._command_topic = f"Q/{self.inverter_id}/CMND/BACKLOG"
+        self._command_topic = f"Q/{self.inverter_id}/cmnd/backlog"
 
         self._workmode_command: Optional[WorkModeCommand] = None  # Store the latest command
 
