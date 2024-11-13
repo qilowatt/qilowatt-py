@@ -47,7 +47,7 @@ class VersionData:
 
 @dataclass
 class WorkModeCommand:
-    Mode: str
+    Mode: str = "normal"
     _source: Optional[str] = None
     BatterySoc: Optional[int] = None
     PowerLimit: Optional[int] = None
