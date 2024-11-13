@@ -45,6 +45,7 @@ class QilowattMQTTClient:
         self._command_topic = f"Q/{self.inverter_id}/cmnd/backlog"
 
         self._workmode_command: Optional[WorkModeCommand] = None  # Store the latest command
+        self._workmode_command = WorkModeCommand.from_dict({"Mode": "normal"})  # Default to normal mode
 
         self._on_command_callback: Optional[Callable[[WorkModeCommand], None]] = None
 
