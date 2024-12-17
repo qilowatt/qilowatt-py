@@ -23,7 +23,7 @@ class QilowattMQTTClient:
         mqtt_username: str,
         mqtt_password: str,
         inverter_id: str,
-        host: str = "test-mqtt.qilowatt.it",
+        host: str = "mqtt.qilowatt.it",
         port: int = 8883,
         tls: bool = True,
     ):
