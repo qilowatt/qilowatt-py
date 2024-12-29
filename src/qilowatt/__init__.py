@@ -11,6 +11,8 @@ from .exceptions import (
     ConnectionError,
     AuthenticationError,
 )
+from .devices.inverter import InverterDevice
+from .devices.switch import SwitchDevice
 
 try:
     from ._version import version as __version__
@@ -19,6 +21,8 @@ except ImportError:
 
 __all__ = [
     "QilowattMQTTClient",
+    "InverterDevice",
+    "SwitchDevice",
     "EnergyData",
     "MetricsData",
     "WorkModeCommand",
