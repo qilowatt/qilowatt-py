@@ -1,23 +1,25 @@
 # example.py
 
 import logging
-from qilowatt import QilowattMQTTClient, EnergyData, MetricsData
+from qilowatt import QilowattMQTTClient
+from qilowatt import EnergyData, MetricsData
+from qilowatt import InverterDevice
 import time
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 
 # User-provided MQTT credentials and inverter ID
-mqtt_username = 'your_username'
-mqtt_password = 'your_password'
-inverter_id = 'your_inverter_id'
+mqtt_username = ''
+mqtt_password = ''
+device = InverterDevice(device_id='')
 
 # Create the Qilowatt MQTT client
 client = QilowattMQTTClient(
     mqtt_username=mqtt_username,
     mqtt_password=mqtt_password,
-    inverter_id=inverter_id,
-    host='test-mqtt.qilowatt.it',
+    device=device,
+    host='mqtt.qilowatt.it',
     port=8883,
     tls=True
 )
@@ -25,7 +27,7 @@ def on_command_received(command):
     print(f"Received WorkMode Command: {command}")
 
 # Set the command callback
-client.set_command_callback(on_command_received)
+device.set_command_callback(on_command_received)
 
 # Connect to the MQTT broker
 client.connect()
@@ -59,8 +61,8 @@ metrics_data = MetricsData(
 )
 
 # Set the data
-client.set_energy_data(energy_data)
-client.set_metrics_data(metrics_data)
+device.set_energy_data(energy_data)
+device.set_metrics_data(metrics_data)
 
 # Now the module will automatically start sending data at the specified intervals
 
@@ -72,7 +74,7 @@ try:
         time.sleep(30)
         # Update ENERGY data if needed
         energy_data.Today += 0.1
-        client.set_energy_data(energy_data)
+        device.set_energy_data(energy_data)
 except KeyboardInterrupt:
     print("Exiting...")
 finally:
