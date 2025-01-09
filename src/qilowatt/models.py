@@ -76,8 +76,8 @@ class SensorData:
     ESP32: ESP32Data = field(default_factory=ESP32Data)
     VERSION: VersionData = field(default_factory=VersionData)
     TempUnit: str = "C"
+    POWER1: int = 1
     WORKMODE: Optional[WorkModeCommand] = None  # Will be set internally
-    POWER1: 1
 
     def to_dict(self) -> dict:
         """Convert the dataclass to a dictionary."""
@@ -89,8 +89,8 @@ class SensorData:
             "METRICS": self.METRICS.__dict__,
             "VERSION": self.VERSION.__dict__,
             "TempUnit": self.TempUnit,
-            "WORKMODE": self.WORKMODE.__dict__ if self.WORKMODE else {},
             "POWER1": self.POWER1,
+            "WORKMODE": self.WORKMODE.__dict__ if self.WORKMODE else {},
         }
         return data
 
