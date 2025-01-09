@@ -77,6 +77,7 @@ class SensorData:
     VERSION: VersionData = field(default_factory=VersionData)
     TempUnit: str = "C"
     WORKMODE: Optional[WorkModeCommand] = None  # Will be set internally
+    POWER1: 1
 
     def to_dict(self) -> dict:
         """Convert the dataclass to a dictionary."""
@@ -89,6 +90,7 @@ class SensorData:
             "VERSION": self.VERSION.__dict__,
             "TempUnit": self.TempUnit,
             "WORKMODE": self.WORKMODE.__dict__ if self.WORKMODE else {},
+            "POWER1": self.POWER1,
         }
         return data
 

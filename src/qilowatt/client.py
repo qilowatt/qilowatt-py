@@ -206,6 +206,7 @@ class QilowattMQTTClient:
             # Add other state fields as necessary
             # For example:
             "Uptime": int((datetime.utcnow() - self._startup_utc).total_seconds()),
+            "POWER1": "ON",
         }
         return state_data
 
