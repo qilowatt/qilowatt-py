@@ -34,6 +34,7 @@ class QilowattMQTTClient:
         self._client = mqtt.Client()
         self._connected = False
         self._lock = threading.Lock()
+        self._connection_callbacks = []
 
         self._setup_client()
 
@@ -47,6 +48,32 @@ class QilowattMQTTClient:
                 _logger.warning(f"Cannot publish to {topic}: not connected")
         
         self.device.set_publish_callback(publish_callback)
+
+    @property
+    def connected(self) -> bool:
+        """Get the current connection state."""
+        return self._connected
+
+    def add_connection_callback(self, callback):
+        """Add a callback to be called when connection state changes.
+        
+        Args:
+            callback: A function that takes a boolean parameter (connected state)
+        """
+        self._connection_callbacks.append(callback)
+
+    def remove_connection_callback(self, callback):
+        """Remove a connection state callback."""
+        if callback in self._connection_callbacks:
+            self._connection_callbacks.remove(callback)
+
+    def _notify_connection_change(self, connected: bool):
+        """Notify all registered callbacks of connection state change."""
+        for callback in self._connection_callbacks:
+            try:
+                callback(connected)
+            except Exception as e:
+                _logger.error(f"Error in connection callback: {e}")
 
     def _setup_client(self):
         if self.tls:
@@ -64,6 +91,7 @@ class QilowattMQTTClient:
             self._connected = True
             # Subscribe to command topic
             client.subscribe(self.device.command_topic)
+            self._notify_connection_change(True)
         elif rc == 5:
             raise AuthenticationError("Authentication failed")
         else:
@@ -72,6 +100,7 @@ class QilowattMQTTClient:
     def _on_disconnect(self, client, userdata, rc):
         _logger.debug(f"Disconnected with result code {rc}")
         self._connected = False
+        self._notify_connection_change(False)
 
     def _on_message(self, client, userdata, msg):
         _logger.debug(f"Message received on {msg.topic}: {msg.payload}")
