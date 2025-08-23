@@ -11,10 +11,6 @@ from .models import (
 import platform
 import socket
 import getmac
-try:
-    from importlib import metadata as importlib_metadata
-except ImportError:
-    import importlib_metadata
 
 _logger = logging.getLogger(__name__)
 
@@ -38,13 +34,6 @@ class BaseDevice(ABC):
         # Default version data - can be overridden by client
         self._version_data = VersionData()
         
-        # Try to automatically detect the qilowatt-py package version
-        try:
-            detected_version = importlib_metadata.version("qilowatt")
-            self._version_data.qilowatt_py = detected_version
-        except importlib_metadata.PackageNotFoundError:
-            # Keep the default value from VersionData
-            pass
         
     @property
     def sensor_topic(self) -> str:
