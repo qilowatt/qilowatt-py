@@ -39,11 +39,19 @@ class MetricsData:
 
 @dataclass
 class VersionData:
-    fs: str = "24.7.1"
-    led: str = "24.3.1"
-    inverter: str = "24.10.2"
-    qilowatt: str = "24.8.1"
-    registers: float = 2.5
+    API: str = "1.0"
+    HA: str = "unknown"
+    qilowatt_ha: str = "unknown"
+    qilowatt_py: str = "unknown"
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary with proper key names."""
+        return {
+            "API": self.API,
+            "HA": self.HA,
+            "qilowatt-ha": self.qilowatt_ha,
+            "qilowatt-py": self.qilowatt_py,
+        }
 
 @dataclass
 class WorkModeCommand:
@@ -88,7 +96,7 @@ class SensorData:
             "ESP32": self.ESP32.__dict__,
             "ENERGY": self.ENERGY.__dict__,
             "METRICS": self.METRICS.__dict__,
-            "VERSION": self.VERSION.__dict__,
+            "VERSION": self.VERSION.to_dict(),
             "TempUnit": self.TempUnit,
             "WORKMODE": self.WORKMODE.__dict__ if self.WORKMODE else {},
         }

@@ -60,6 +60,7 @@ class InverterDevice(BaseDevice):
         sensor_data = {
             "Time": datetime.utcnow().isoformat(),
             "POWER1": 0,
+            "VERSION": self.get_version_data(),
             "ENERGY": self._energy_data.__dict__,
             "METRICS": self._metrics_data.__dict__,
             "WORKMODE": self._workmode_command.__dict__
