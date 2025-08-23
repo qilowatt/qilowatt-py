@@ -55,7 +55,8 @@ class SwitchDevice(BaseDevice):
         """Get current sensor data."""
         return {
             "Time": datetime.utcnow().isoformat(),
-            "Switch1": "ON" if self._state else "OFF"
+            "Switch1": "ON" if self._state else "OFF",
+            "VERSION": self.get_version_data(),
         }
     
     def get_state_data(self) -> Dict[str, Any]:

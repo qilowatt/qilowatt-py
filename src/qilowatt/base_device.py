@@ -6,11 +6,15 @@ from datetime import datetime, timezone
 from .models import (
     Status0Data,
     StatusData, StatusPRMData, StatusFWRData, StatusLOGData,
-    StatusNETData, StatusMQTData, StatusTIMData
+    StatusNETData, StatusMQTData, StatusTIMData, VersionData
 )
 import platform
 import socket
 import getmac
+try:
+    from importlib import metadata as importlib_metadata
+except ImportError:
+    import importlib_metadata
 
 _logger = logging.getLogger(__name__)
 
@@ -30,6 +34,17 @@ class BaseDevice(ABC):
         
         self._startup_utc = datetime.utcnow()
         self._boot_count = 1
+        
+        # Default version data - can be overridden by client
+        self._version_data = VersionData()
+        
+        # Try to automatically detect the qilowatt-py package version
+        try:
+            detected_version = importlib_metadata.version("qilowatt")
+            self._version_data.qilowatt_py = detected_version
+        except importlib_metadata.PackageNotFoundError:
+            # Keep the default value from VersionData
+            pass
         
     @property
     def sensor_topic(self) -> str:
@@ -72,6 +87,22 @@ class BaseDevice(ABC):
         """Get current state data."""
         pass
     
+    def get_version_data(self) -> Dict[str, Any]:
+        """Get version data for the device."""
+        return self._version_data.to_dict()
+
+    def set_version_data(self, version_data: Dict[str, Any]):
+        """Set version data for the device."""
+        # Update individual fields from the dictionary
+        if "API" in version_data:
+            self._version_data.API = version_data["API"]
+        if "HA" in version_data:
+            self._version_data.HA = version_data["HA"]
+        if "qilowatt-ha" in version_data:
+            self._version_data.qilowatt_ha = version_data["qilowatt-ha"]
+        if "qilowatt-py" in version_data:
+            self._version_data.qilowatt_py = version_data["qilowatt-py"]
+
     def start_timers(self):
         """Start all data publishing timers."""
         self._start_sensor_timer()
@@ -101,6 +132,11 @@ class BaseDevice(ABC):
 
     def publish_sensor_data(self):
         sensor_data = self.get_sensor_data()
+        # Ensure VERSION is always present even if device doesn't provide it
+        if not isinstance(sensor_data, dict):
+            sensor_data = {}
+        if "VERSION" not in sensor_data:
+            sensor_data["VERSION"] = self.get_version_data()
         # Callback will be set by client
         if hasattr(self, '_publish_callback'):
             self._publish_callback(self.sensor_topic, sensor_data)
