@@ -63,6 +63,8 @@ class WorkModeCommand:
     ChargeCurrent: Optional[int] = None
     DischargeCurrent: Optional[int] = None
     MaxPower: Optional[int] = None
+    MxByPw: Optional[int] = None
+    MxSlPw: Optional[int] = None
 
     @classmethod
     def from_dict(cls, data: dict) -> 'WorkModeCommand':
@@ -75,6 +77,8 @@ class WorkModeCommand:
             ChargeCurrent=data.get("ChargeCurrent"),
             DischargeCurrent=data.get("DischargeCurrent"),
             MaxPower=data.get("MaxPower"),
+            MxByPw=data.get("MxByPw"),
+            MxSlPw=data.get("MxSlPw"),
         )
 
 @dataclass
