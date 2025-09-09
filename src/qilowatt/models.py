@@ -1,7 +1,6 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import List, Optional
 from datetime import datetime
-import uuid
 
 @dataclass
 class PingData:
@@ -65,21 +64,39 @@ class WorkModeCommand:
     MaxPower: Optional[int] = None
     MxByPw: Optional[int] = None
     MxSlPw: Optional[int] = None
+    # Container for any additional / unknown keys sent by device or API
+    extras: dict = field(default_factory=dict, repr=False)
 
     @classmethod
     def from_dict(cls, data: dict) -> 'WorkModeCommand':
-        return cls(
-            Mode=data.get("Mode"),
-            _source=data.get("_source"),
-            BatterySoc=data.get("BatterySoc"),
-            PowerLimit=data.get("PowerLimit"),
-            PeakShaving=data.get("PeakShaving"),
-            ChargeCurrent=data.get("ChargeCurrent"),
-            DischargeCurrent=data.get("DischargeCurrent"),
-            MaxPower=data.get("MaxPower"),
-            MxByPw=data.get("MxByPw"),
-            MxSlPw=data.get("MxSlPw"),
-        )
+        if data is None:
+            return cls()
+        known = {f.name for f in fields(cls)} - {"extras"}
+        kwargs = {k: v for k, v in data.items() if k in known}
+        extras = {k: v for k, v in data.items() if k not in known}
+        obj = cls(**kwargs)
+        obj.extras = extras
+        return obj
+
+    def to_dict(self) -> dict:
+        base = {k: getattr(self, k) for k in (
+            "Mode", "_source", "BatterySoc", "PowerLimit", "PeakShaving",
+            "ChargeCurrent", "DischargeCurrent", "MaxPower", "MxByPw", "MxSlPw"
+        ) if getattr(self, k) is not None}
+        # Merge extras without overwriting explicit attributes unless not set
+        for k, v in self.extras.items():
+            if k not in base:
+                base[k] = v
+        return base
+
+    def __getattr__(self, item):
+        # Allow attribute-style access to extras
+        if item in self.extras:
+            return self.extras[item]
+        raise AttributeError(item)
+
+    def __getitem__(self, item):
+        return self.to_dict()[item]
 
 @dataclass
 class SensorData:
@@ -102,7 +119,7 @@ class SensorData:
             "METRICS": self.METRICS.__dict__,
             "VERSION": self.VERSION.to_dict(),
             "TempUnit": self.TempUnit,
-            "WORKMODE": self.WORKMODE.__dict__ if self.WORKMODE else {},
+            "WORKMODE": self.WORKMODE.to_dict() if self.WORKMODE else {},
         }
         return data
 
