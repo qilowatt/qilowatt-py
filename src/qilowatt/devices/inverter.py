@@ -63,7 +63,7 @@ class InverterDevice(BaseDevice):
             "VERSION": self.get_version_data(),
             "ENERGY": self._energy_data.__dict__,
             "METRICS": self._metrics_data.__dict__,
-            "WORKMODE": self._workmode_command.__dict__
+            "WORKMODE": self._workmode_command.to_dict()
         }
         return sensor_data
 
