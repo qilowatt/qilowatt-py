@@ -37,7 +37,7 @@ class QilowattMQTTClient:
         self._connection_callbacks: List[Callable[[bool], None]] = []
         
         # Enable automatic reconnection
-        self._client.reconnect_delay_set(min_delay=1, max_delay=60)
+        self._client.reconnect_delay_set(min_delay=10, max_delay=60)
 
         self._setup_client()
 
