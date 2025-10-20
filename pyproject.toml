@@ -38,6 +38,11 @@ Documentation = "https://github.com/qilowatt/qilowatt-py#readme"
 Issues = "https://github.com/qilowatt/qilowatt-py/issues"
 Repository = "https://github.com/qilowatt/qilowatt-py"
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
