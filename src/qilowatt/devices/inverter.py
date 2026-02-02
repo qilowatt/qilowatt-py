@@ -10,7 +10,7 @@ from typing import Optional, Dict, Any, Callable
 _logger = logging.getLogger(__name__)
 
 # Absolute maximum power limit - failsafe that cannot be exceeded
-ABSOLUTE_MAX_POWER = 50000.0
+ABSOLUTE_MAX_POWER = 100000.0
 
 class InverterDevice(BaseDevice):
     """Implementation of an inverter device."""
