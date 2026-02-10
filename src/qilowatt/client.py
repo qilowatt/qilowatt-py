@@ -240,8 +240,8 @@ class QilowattMQTTClient:
         if self._subscribe_timer:
             try:
                 self._subscribe_timer.cancel()
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.debug("Error while cancelling subscribe timer: %s", exc)
             finally:
                 self._subscribe_timer = None
 
