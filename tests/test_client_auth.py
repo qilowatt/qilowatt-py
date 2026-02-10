@@ -85,7 +85,7 @@ def test_authentication_failure_triggers_retry(patched_environment):
     )
 
     client.connect()
-    client._on_connect(patched_environment, None, None, 5)
+    client._on_connect(patched_environment, None, MagicMock(), 5, None)
 
     wait_for_threads()
 
@@ -106,11 +106,11 @@ def test_authentication_failure_stops_after_max_attempts(patched_environment):
     )
 
     client.connect()
-    client._on_connect(patched_environment, None, None, 5)
+    client._on_connect(patched_environment, None, MagicMock(), 5, None)
 
     wait_for_threads()
 
-    client._on_connect(patched_environment, None, None, 5)
+    client._on_connect(patched_environment, None, MagicMock(), 5, None)
 
     assert isinstance(client.last_error(), AuthenticationError)
     assert device.stop_called is True
