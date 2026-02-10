@@ -80,18 +80,26 @@ class QilowattMQTTClient:
 
     @property
     def connected(self) -> bool:
-        """Get the current connection state using Paho's built-in method."""
-        is_connected = self._client.is_connected()
-        # Sync our internal state with Paho's state
-        if self._connected != is_connected:
-            self._connected = is_connected
-            self._notify_connection_change(is_connected)
-        return is_connected
+        """Get the current connection state.
+
+        Returns True only when fully connected AND subscribed to command topic.
+        This property has no side effects.
+        """
+        return self._connected
 
     @property
     def subscribed(self) -> bool:
         """Get the subscription state. True if subscribed to command topic."""
         return self._subscribed
+
+    @property
+    def transport_connected(self) -> bool:
+        """Get the raw transport connection state from Paho client.
+
+        Returns True if the underlying MQTT transport is connected,
+        regardless of subscription state.
+        """
+        return self._client.is_connected()
 
     def add_connection_callback(self, callback: Callable[[bool], None]) -> None:
         """Add a callback to be called when connection state changes.
