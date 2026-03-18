@@ -25,7 +25,7 @@ class MetricsData:
     PvVoltage: List[float]
     PvCurrent: List[float]
     LoadPower: List[float]
-    BatterySOC: int
+    BatterySOC: List[int]
     LoadCurrent: List[float]
     BatteryPower: List[float]
     BatteryCurrent: List[float]
