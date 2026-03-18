@@ -38,15 +38,23 @@ class QilowattMQTTClient:
         self._auth_retry_delay = max(0.0, auth_retry_delay)
         self._max_auth_retry_delay = max(self._auth_retry_delay, max_auth_retry_delay)
 
-        self._client = mqtt.Client()
+        self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self._connected = False
+        self._subscribed = False
         self._lock = threading.Lock()
         self._connection_callbacks: List[Callable[[bool], None]] = []
         self._auth_failures = 0
         self._retry_timer: Optional[threading.Timer] = None
         self._last_error: Optional[Exception] = None
         self._shutdown = False
-        
+
+        # Subscription tracking
+        self._pending_subscribe_mid: Optional[int] = None
+        self._subscribe_timer: Optional[threading.Timer] = None
+        self._subscribe_attempts = 0
+        self._max_subscribe_retries = 3
+        self._subscribe_timeout = 5.0  # seconds to wait for SUBACK
+
         # Enable automatic reconnection
         self._client.reconnect_delay_set(min_delay=10, max_delay=60)
 
@@ -72,13 +80,26 @@ class QilowattMQTTClient:
 
     @property
     def connected(self) -> bool:
-        """Get the current connection state using Paho's built-in method."""
-        is_connected = self._client.is_connected()
-        # Sync our internal state with Paho's state
-        if self._connected != is_connected:
-            self._connected = is_connected
-            self._notify_connection_change(is_connected)
-        return is_connected
+        """Get the current connection state.
+
+        Returns True only when fully connected AND subscribed to command topic.
+        This property has no side effects.
+        """
+        return self._connected
+
+    @property
+    def subscribed(self) -> bool:
+        """Get the subscription state. True if subscribed to command topic."""
+        return self._subscribed
+
+    @property
+    def transport_connected(self) -> bool:
+        """Get the raw transport connection state from Paho client.
+
+        Returns True if the underlying MQTT transport is connected,
+        regardless of subscription state.
+        """
+        return self._client.is_connected()
 
     def add_connection_callback(self, callback: Callable[[bool], None]) -> None:
         """Add a callback to be called when connection state changes.
@@ -110,31 +131,35 @@ class QilowattMQTTClient:
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message
         self._client.on_disconnect = self._on_disconnect
-        
+        self._client.on_subscribe = self._on_subscribe
+
         # Set keep-alive to detect connection issues faster
         self._client.keepalive = 30
 
-    def _on_connect(self, client, userdata, flags, rc):
-        _logger.debug(f"Connected with result code {rc}")
-        if rc == 0:
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        _logger.debug(f"Connected with result code {reason_code}")
+        if reason_code == 0:
             self._cancel_retry_timer()
-            self._connected = True
             self._auth_failures = 0
             self._last_error = None
-            # Subscribe to command topic
-            client.subscribe(self.device.command_topic)
-            self._notify_connection_change(True)
-        elif rc == 5:
+            self._subscribed = False
+            self._subscribe_attempts = 0
+            # Subscribe to command topic and wait for SUBACK
+            self._attempt_subscribe()
+        elif reason_code == 5:
             self._handle_authentication_failure()
         else:
-            error = ConnectionError(f"Connection failed with result code {rc}")
+            error = ConnectionError(f"Connection failed with result code {reason_code}")
             self._last_error = error
             self._connected = False
             self._notify_connection_change(False)
             _logger.error(str(error))
 
-    def _on_disconnect(self, client, userdata, rc):
-        _logger.debug(f"Disconnected with result code {rc}")
+    def _on_disconnect(self, client, userdata, flags, reason_code, properties):
+        _logger.debug(f"Disconnected with result code {reason_code}")
+        self._cancel_subscribe_timer()
+        self._subscribed = False
+        self._pending_subscribe_mid = None
         self._connected = False
         self._notify_connection_change(False)
 
@@ -143,12 +168,91 @@ class QilowattMQTTClient:
         if msg.topic == self.device.command_topic:
             self.device.handle_command(msg.payload)
 
+    def _attempt_subscribe(self):
+        """Attempt to subscribe to the command topic with timeout tracking."""
+        if self._shutdown or not self._client.is_connected():
+            return
+
+        self._subscribe_attempts += 1
+        topic = self.device.command_topic
+        result, mid = self._client.subscribe(topic)
+
+        if result == mqtt.MQTT_ERR_SUCCESS:
+            self._pending_subscribe_mid = mid
+            _logger.debug(
+                f"Subscribe request sent (mid={mid}, attempt {self._subscribe_attempts})"
+            )
+            # Start timeout timer
+            self._cancel_subscribe_timer()
+            self._subscribe_timer = threading.Timer(
+                self._subscribe_timeout, self._on_subscribe_timeout
+            )
+            self._subscribe_timer.daemon = True
+            self._subscribe_timer.start()
+        else:
+            _logger.warning(f"Failed to send subscribe request: {result}")
+            self._handle_subscribe_failure()
+
+    def _on_subscribe(self, client, userdata, mid, reason_codes, properties):
+        """Called when subscription is acknowledged by the broker."""
+        _logger.debug(f"Subscription confirmed (mid={mid}, qos={reason_codes})")
+
+        # Check if this is the subscription we're waiting for
+        if mid == self._pending_subscribe_mid:
+            self._cancel_subscribe_timer()
+            self._pending_subscribe_mid = None
+            self._subscribed = True
+            self._subscribe_attempts = 0
+
+            # Now we're fully connected and subscribed
+            if not self._connected:
+                self._connected = True
+                self._notify_connection_change(True)
+
+    def _on_subscribe_timeout(self):
+        """Called when subscription confirmation times out."""
+        _logger.warning(
+            f"Subscribe timeout (attempt {self._subscribe_attempts}/{self._max_subscribe_retries})"
+        )
+        self._pending_subscribe_mid = None
+        self._handle_subscribe_failure()
+
+    def _handle_subscribe_failure(self):
+        """Handle failed subscription attempt with retry logic."""
+        if self._shutdown or not self._client.is_connected():
+            return
+
+        if self._subscribe_attempts < self._max_subscribe_retries:
+            _logger.info("Retrying subscription...")
+            self._attempt_subscribe()
+        else:
+            _logger.error(
+                f"Subscription failed after {self._max_subscribe_retries} attempts"
+            )
+            # Still mark as connected so publishing works, but log the issue
+            # The client can still publish, just won't receive commands
+            if not self._connected:
+                self._connected = True
+                self._notify_connection_change(True)
+
+    def _cancel_subscribe_timer(self):
+        """Cancel the subscription timeout timer."""
+        if self._subscribe_timer:
+            try:
+                self._subscribe_timer.cancel()
+            except Exception as exc:
+                _logger.debug("Error while cancelling subscribe timer: %s", exc)
+            finally:
+                self._subscribe_timer = None
+
     def connect(self):
         """Connect to the MQTT broker and start the loop."""
         with self._lock:
             if not self._client.is_connected():
                 self._shutdown = False
                 self._auth_failures = 0
+                self._subscribe_attempts = 0
+                self._subscribed = False
                 self._last_error = None
                 self._client.connect(self.host, self.port, keepalive=30)
                 self._client.loop_start()
@@ -158,10 +262,12 @@ class QilowattMQTTClient:
         with self._lock:
             self._shutdown = True
             self._cancel_retry_timer()
+            self._cancel_subscribe_timer()
             if self._connected or self._client.is_connected():
                 self._client.loop_stop()
                 self._client.disconnect()
                 self._connected = False
+                self._subscribed = False
                 self._notify_connection_change(False)
         self.device.stop_timers()
 
