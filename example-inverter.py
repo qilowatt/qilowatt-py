@@ -57,6 +57,7 @@ metrics_data = MetricsData(
     BatteryVoltage=[48.0],
     GenVoltage=[0.0, 0.0, 0.0],
     GenPower=[0.0, 0.0, 0.0],
+    GenCurrent=[0.0, 0.0, 0.0],
     GridExportLimit=5000.0,
     BatteryTemperature=[30.0],
     InverterTemperature=40.0
