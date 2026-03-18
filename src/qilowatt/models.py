@@ -32,6 +32,7 @@ class MetricsData:
     BatteryVoltage: List[float]
     GenVoltage: List[float]
     GenPower: List[float]
+    GenCurrent: List[float]
     GridExportLimit: float
     BatteryTemperature: List[float]
     InverterTemperature: float
