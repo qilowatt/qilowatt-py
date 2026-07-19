@@ -4,7 +4,7 @@ from ..models import (
 )
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Callable
 
 _logger = logging.getLogger(__name__)
@@ -45,15 +45,17 @@ class InverterDevice(BaseDevice):
         """Handle WORKMODE commands."""
         try:
             message = payload.decode('utf-8')
-            if message.startswith("WORKMODE"):
-                json_part = message[len("WORKMODE "):]
-                data = json.loads(json_part)
+            if message.startswith("WORKMODE "):
+                data = json.loads(message[len("WORKMODE "):])
+                if not isinstance(data, dict):
+                    _logger.warning("Ignoring WORKMODE command with non-object payload: %r", data)
+                    return
                 command = WorkModeCommand.from_dict(data)
                 self._workmode_command = command
                 if self._on_command_callback:
                     self._on_command_callback(command)
-        except Exception as e:
-            _logger.error(f"Error processing command message: {e}")
+        except Exception:
+            _logger.exception("Error processing command message")
 
     def set_command_callback(self, callback: Callable[[WorkModeCommand], None]):
         """Set callback for command handling."""
@@ -90,21 +92,26 @@ class InverterDevice(BaseDevice):
         """Get current sensor data."""
         if not self._data_initialized:
             return {}
-        
+
+        # Take local references so a concurrent set_energy_data/set_metrics_data
+        # call can't swap the objects out mid-read
+        energy_data = self._energy_data
+        metrics_data = self._metrics_data
+
         # Apply power limits to energy data
-        energy_dict = self._energy_data.__dict__.copy()
+        energy_dict = energy_data.__dict__.copy()
         energy_dict["Power"] = self._apply_power_limits(
-            self._energy_data.Power, self._max_energy_power
+            energy_data.Power, self._max_energy_power
         )
-        
+
         # Apply power limits to metrics data
-        metrics_dict = self._metrics_data.__dict__.copy()
+        metrics_dict = metrics_data.__dict__.copy()
         metrics_dict["BatteryPower"] = self._apply_power_limits(
-            self._metrics_data.BatteryPower, self._max_battery_power
+            metrics_data.BatteryPower, self._max_battery_power
         )
-            
+
         sensor_data = {
-            "Time": datetime.utcnow().isoformat(),
+            "Time": datetime.now(timezone.utc).isoformat(),
             "POWER1": 0,
             "VERSION": self.get_version_data(),
             "ENERGY": energy_dict,
@@ -115,7 +122,8 @@ class InverterDevice(BaseDevice):
 
     def get_state_data(self) -> Dict[str, Any]:
         """Get current state data."""
+        now = datetime.now(timezone.utc)
         return {
-            "Time": datetime.utcnow().isoformat(),
-            "Uptime": int((datetime.utcnow() - self._startup_utc).total_seconds()),
+            "Time": now.isoformat(),
+            "Uptime": int((now - self._startup_utc).total_seconds()),
         }

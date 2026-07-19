@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field, fields
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 @dataclass
 class PingData:
@@ -93,9 +93,13 @@ class WorkModeCommand:
         return base
 
     def __getattr__(self, item):
-        # Allow attribute-style access to extras
-        if item in self.extras:
-            return self.extras[item]
+        # Allow attribute-style access to extras. Guard against recursion:
+        # during unpickling/copying "extras" itself may not be set yet.
+        if item == "extras":
+            raise AttributeError(item)
+        extras = self.__dict__.get("extras")
+        if extras and item in extras:
+            return extras[item]
         raise AttributeError(item)
 
     def __getitem__(self, item):
@@ -106,7 +110,7 @@ class SensorData:
     ENERGY: EnergyData
     METRICS: MetricsData
     PING: PingData = field(default_factory=PingData)
-    Time: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    Time: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     ESP32: ESP32Data = field(default_factory=ESP32Data)
     VERSION: VersionData = field(default_factory=VersionData)
     TempUnit: str = "C"

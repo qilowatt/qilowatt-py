@@ -95,6 +95,57 @@ def test_authentication_failure_triggers_retry(patched_environment):
     client.disconnect()
 
 
+def test_authentication_failure_detected_with_paho2_reason_code(patched_environment):
+    """paho 2.x VERSION2 callbacks deliver MQTT v3 CONNACK code 5 as
+    ReasonCode 135 ("Not authorized"); the client must recognize it."""
+    from paho.mqtt.packettypes import PacketTypes
+    from paho.mqtt.reasoncodes import ReasonCode
+
+    device = DummyDevice()
+    client = QilowattMQTTClient(
+        mqtt_username="user",
+        mqtt_password="pass",
+        device=device,
+        max_auth_retries=2,
+        auth_retry_delay=0.01,
+    )
+
+    client.connect()
+    reason_code = ReasonCode(PacketTypes.CONNACK, "Not authorized")
+    client._on_connect(patched_environment, None, MagicMock(), reason_code, None)
+
+    wait_for_threads()
+
+    assert patched_environment.reconnect.called
+
+    client.disconnect()
+
+
+def test_bad_credentials_reason_code_detected(patched_environment):
+    """ReasonCode 134 ("Bad user name or password") must also trigger retry."""
+    from paho.mqtt.packettypes import PacketTypes
+    from paho.mqtt.reasoncodes import ReasonCode
+
+    device = DummyDevice()
+    client = QilowattMQTTClient(
+        mqtt_username="user",
+        mqtt_password="pass",
+        device=device,
+        max_auth_retries=2,
+        auth_retry_delay=0.01,
+    )
+
+    client.connect()
+    reason_code = ReasonCode(PacketTypes.CONNACK, "Bad user name or password")
+    client._on_connect(patched_environment, None, MagicMock(), reason_code, None)
+
+    wait_for_threads()
+
+    assert patched_environment.reconnect.called
+
+    client.disconnect()
+
+
 def test_authentication_failure_stops_after_max_attempts(patched_environment):
     device = DummyDevice()
     client = QilowattMQTTClient(

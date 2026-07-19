@@ -1,7 +1,7 @@
 from ..base_device import BaseDevice
 from typing import Dict, Any
 from typing import Callable, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 
 _logger = logging.getLogger(__name__)
@@ -20,7 +20,7 @@ class SwitchDevice(BaseDevice):
         """Send an update to the MQTT broker."""
         self.publish_sensor_data()
         self.publish_state_data()
-        self._publish_callback(self.power_topic, 1 if self._state else 0)
+        self._publish(self.power_topic, 1 if self._state else 0)
     
     def set_command_callback(self, callback: Callable[[bool], None]):
         """Set callback for command handling."""
@@ -54,15 +54,16 @@ class SwitchDevice(BaseDevice):
     def get_sensor_data(self) -> Dict[str, Any]:
         """Get current sensor data."""
         return {
-            "Time": datetime.utcnow().isoformat(),
+            "Time": datetime.now(timezone.utc).isoformat(),
             "Switch1": "ON" if self._state else "OFF",
             "VERSION": self.get_version_data(),
         }
-    
+
     def get_state_data(self) -> Dict[str, Any]:
         """Get current state data."""
+        now = datetime.now(timezone.utc)
         return {
-            "Time": datetime.utcnow().isoformat(),
-            "Uptime": int((datetime.utcnow() - self._startup_utc).total_seconds()),
+            "Time": now.isoformat(),
+            "Uptime": int((now - self._startup_utc).total_seconds()),
             "POWER1": "ON" if self._state else "OFF",
         }

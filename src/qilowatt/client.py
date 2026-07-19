@@ -11,6 +11,18 @@ from .base_device import BaseDevice
 
 _logger = logging.getLogger(__name__)
 
+# CONNACK reason codes that indicate an authentication problem.
+# MQTT v3.1.1 uses 4 (bad username/password) and 5 (not authorized);
+# paho 2.x VERSION2 callbacks convert those to the MQTT v5 equivalents
+# 134 and 135, so all four must be recognized.
+_AUTH_FAILURE_CODES = {4, 5, 134, 135}
+
+
+def _reason_code_value(reason_code) -> int:
+    """Normalize a paho reason code (int or ReasonCode object) to an int."""
+    return getattr(reason_code, "value", reason_code)
+
+
 class QilowattMQTTClient:
     """Client to handle MQTT communication with Qilowatt server."""
 
@@ -22,6 +34,7 @@ class QilowattMQTTClient:
         host: str = "mqtt.qilowatt.it",
         port: int = 8883,
         tls: bool = True,
+        tls_insecure: bool = False,
         max_auth_retries: int = 5,
         auth_retry_delay: float = 5.0,
         max_auth_retry_delay: float = 60.0,
@@ -33,6 +46,7 @@ class QilowattMQTTClient:
         self.host = host
         self.port = port
         self.tls = tls
+        self.tls_insecure = tls_insecure
 
         self._max_auth_retries = max(0, max_auth_retries)
         self._auth_retry_delay = max(0.0, auth_retry_delay)
@@ -75,8 +89,10 @@ class QilowattMQTTClient:
                 if self._connected:
                     self._connected = False
                     self._notify_connection_change(False)
-        
+
         self.device.set_publish_callback(publish_callback)
+        # Let the device report the real broker details in STATUS0
+        self.device.set_mqtt_info(host=host, port=port, username=mqtt_username)
 
     @property
     def connected(self) -> bool:
@@ -116,7 +132,8 @@ class QilowattMQTTClient:
 
     def _notify_connection_change(self, connected: bool):
         """Notify all registered callbacks of connection state change."""
-        for callback in self._connection_callbacks:
+        # Iterate over a copy so callbacks can add/remove callbacks safely
+        for callback in list(self._connection_callbacks):
             try:
                 callback(connected)
             except Exception as e:
@@ -124,8 +141,16 @@ class QilowattMQTTClient:
 
     def _setup_client(self):
         if self.tls:
-            self._client.tls_set(cert_reqs=ssl.CERT_NONE)
-            self._client.tls_insecure_set(True)
+            if self.tls_insecure:
+                _logger.warning(
+                    "TLS certificate verification is disabled; the connection "
+                    "is vulnerable to man-in-the-middle attacks"
+                )
+                self._client.tls_set(cert_reqs=ssl.CERT_NONE)
+                self._client.tls_insecure_set(True)
+            else:
+                # Verify the broker certificate against the system CA store
+                self._client.tls_set()
 
         self._client.username_pw_set(self.mqtt_username, self.mqtt_password)
         self._client.on_connect = self._on_connect
@@ -138,7 +163,8 @@ class QilowattMQTTClient:
 
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         _logger.debug(f"Connected with result code {reason_code}")
-        if reason_code == 0:
+        rc_value = _reason_code_value(reason_code)
+        if rc_value == 0:
             self._cancel_retry_timer()
             self._auth_failures = 0
             self._last_error = None
@@ -146,7 +172,7 @@ class QilowattMQTTClient:
             self._subscribe_attempts = 0
             # Subscribe to command topic and wait for SUBACK
             self._attempt_subscribe()
-        elif reason_code == 5:
+        elif rc_value in _AUTH_FAILURE_CODES:
             self._handle_authentication_failure()
         else:
             error = ConnectionError(f"Connection failed with result code {reason_code}")
@@ -160,8 +186,12 @@ class QilowattMQTTClient:
         self._cancel_subscribe_timer()
         self._subscribed = False
         self._pending_subscribe_mid = None
+        was_connected = self._connected
         self._connected = False
-        self._notify_connection_change(False)
+        # Only notify on an actual state change; each failed reconnect
+        # attempt also fires on_disconnect and would spam callbacks
+        if was_connected:
+            self._notify_connection_change(False)
 
     def _on_message(self, client, userdata, msg):
         _logger.debug(f"Message received on {msg.topic}: {msg.payload}")
@@ -264,8 +294,10 @@ class QilowattMQTTClient:
             self._cancel_retry_timer()
             self._cancel_subscribe_timer()
             if self._connected or self._client.is_connected():
-                self._client.loop_stop()
+                # Send the DISCONNECT packet before stopping the network loop,
+                # so the broker sees a clean disconnect instead of a timeout
                 self._client.disconnect()
+                self._client.loop_stop()
                 self._connected = False
                 self._subscribed = False
                 self._notify_connection_change(False)
@@ -276,8 +308,10 @@ class QilowattMQTTClient:
         return self._last_error
 
     def _handle_authentication_failure(self):
+        was_connected = self._connected
         self._connected = False
-        self._notify_connection_change(False)
+        if was_connected:
+            self._notify_connection_change(False)
         self._auth_failures += 1
 
         if self._auth_failures > self._max_auth_retries:
