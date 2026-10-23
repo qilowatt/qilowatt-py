@@ -263,9 +263,12 @@ class BaseDevice(ABC):
         next_at = time.monotonic() + self._status0_interval
         while True:
             request.wait(max(0.0, next_at - time.monotonic()))
+            # Clear before checking stop: stop_timers() sets stop then request,
+            # so a stop landing after this clear leaves its wakeup for the next
+            # iteration instead of being erased and waited out for an interval.
+            request.clear()
             if stop.is_set():
                 return
-            request.clear()
             try:
                 self.publish_status0_data()
             except Exception:

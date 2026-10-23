@@ -259,6 +259,40 @@ def test_status0_reports_real_endpoint_version_and_interval(monkeypatch):
     assert status["StatusNET"]["Mac"] == "aa:bb:cc:dd:ee:ff"
 
 
+def test_stop_arriving_between_wakeup_and_clear_is_not_lost():
+    """Regression: stop_timers() sets the stop flag and the request event. If
+    that landed after the loop's stop check but before it cleared the request,
+    the wakeup was erased and the loop slept a whole interval (an hour by
+    default) with disconnect() joined on it. Inject the stop sequence exactly
+    at the clear() to reproduce."""
+    dev = Status0Device(status0_interval=0.3)
+
+    class StopDuringClear(threading.Event):
+        def __init__(self, device):
+            super().__init__()
+            self.device = device
+            self.injected = False
+
+        def clear(self):
+            if not self.injected:
+                self.injected = True
+                # What stop_timers() does, racing this exact point
+                self.device._status0_timer_stop_event.set()
+                self.set()
+            super().clear()
+
+    dev._status0_request = StopDuringClear(dev)
+    dev._start_status0_timer()
+    dev.on_connected()                                   # wakes the loop -> clear()
+    start = time.monotonic()
+    dev._status0_timer_thread.join(timeout=2.0)
+    exited_after = time.monotonic() - start
+
+    assert not dev._status0_timer_thread.is_alive(), "loop kept running after stop"
+    assert exited_after < 0.2, f"loop took {exited_after:.2f}s to notice the stop"
+    assert dev.status_sends == []                        # no publish after stop
+
+
 def test_net_info_failure_falls_back_to_placeholders(monkeypatch):
     import qilowatt.base_device as bd
 
