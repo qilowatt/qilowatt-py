@@ -30,14 +30,16 @@ class MetricsData:
     BatteryPower: List[float]
     BatteryCurrent: List[float]
     BatteryVoltage: List[float]
-    GenVoltage: List[float]
-    GenPower: List[float]
-    GenCurrent: List[float]
     GridExportLimit: float
     BatteryTemperature: List[float]
     InverterTemperature: float
     AlarmCodes: List[int] = field(default_factory=lambda: [0, 0, 0, 0, 0, 0])
     InverterStatus: int = 2  # Default value
+    # Generator input, per phase. Optional: systems without a generator
+    # report zeros, matching the payload the Qilowatt backend expects.
+    GenVoltage: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    GenPower: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    GenCurrent: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
 
 @dataclass
 class VersionData:
