@@ -22,6 +22,7 @@ class InverterDevice(BaseDevice):
         self._workmode_command = WorkModeCommand.from_dict({"Mode": "normal"})
         self._on_command_callback: Optional[Callable[[WorkModeCommand], None]] = None
         self._data_provider: Optional[Callable[[], Tuple[EnergyData, MetricsData]]] = None
+        self._provider_has_data = True
         
         # Max value limits - values exceeding these will be reported as 0
         self._max_energy_power: Optional[float] = None
@@ -52,29 +53,38 @@ class InverterDevice(BaseDevice):
         Callers using a provider do not need set_energy_data / set_metrics_data.
 
         The provider is called on the sensor timer thread and must return an
-        (EnergyData, MetricsData) tuple. If it raises, the error is logged and
-        the last successfully read data is published instead; if there is no
-        such data yet, that slot is skipped. Setting a provider starts the
-        publishing timers; pass None to stop pulling (the last data is kept).
+        (EnergyData, MetricsData) tuple. It may return (None, None), or raise,
+        when it has no trustworthy data (source entities unavailable): that
+        SENSOR slot is then skipped. Stale data is never re-published and
+        nothing is invented. Setting a provider starts the publishing
+        timers; pass None to stop pulling (the last data is kept).
         """
         self._data_provider = provider
         if provider is not None and not self._data_initialized:
             self._data_initialized = True
             self.start_timers()
 
-    def _refresh_from_provider(self):
+    def _refresh_from_provider(self) -> bool:
+        """Pull data from the provider; return whether this slot may publish."""
         if self._data_provider is None:
-            return
+            return True
+        energy_data = metrics_data = None
         try:
             energy_data, metrics_data = self._data_provider()
         except Exception:
-            _logger.exception("Data provider failed; publishing last known data")
-            return
+            if self._provider_has_data:
+                _logger.exception("Data provider failed")
         if energy_data is None or metrics_data is None:
-            _logger.warning("Data provider returned no data; publishing last known data")
-            return
+            if self._provider_has_data:
+                self._provider_has_data = False
+                _logger.warning("Data provider has no data; skipping SENSOR publishes until it recovers")
+            return False
+        if not self._provider_has_data:
+            self._provider_has_data = True
+            _logger.info("Data provider delivers data again")
         self._energy_data = energy_data
         self._metrics_data = metrics_data
+        return True
             
     def handle_command(self, payload: bytes):
         """Handle WORKMODE commands."""
@@ -123,7 +133,8 @@ class InverterDevice(BaseDevice):
 
     def get_sensor_data(self) -> Dict[str, Any]:
         """Get current sensor data."""
-        self._refresh_from_provider()
+        if not self._refresh_from_provider():
+            return {}
         if not self._data_initialized or self._energy_data is None or self._metrics_data is None:
             return {}
         
