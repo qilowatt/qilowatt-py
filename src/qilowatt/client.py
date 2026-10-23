@@ -161,7 +161,8 @@ class QilowattMQTTClient:
             self._error_callbacks.remove(callback)
 
     def _notify_error(self, error: Exception):
-        for callback in self._error_callbacks:
+        # Snapshot: a callback may unregister itself while handling the error
+        for callback in list(self._error_callbacks):
             try:
                 callback(error)
             except Exception as e:
@@ -169,7 +170,8 @@ class QilowattMQTTClient:
 
     def _notify_connection_change(self, connected: bool):
         """Notify all registered callbacks of connection state change."""
-        for callback in self._connection_callbacks:
+        # Snapshot: a callback may unregister itself while handling the change
+        for callback in list(self._connection_callbacks):
             try:
                 callback(connected)
             except Exception as e:

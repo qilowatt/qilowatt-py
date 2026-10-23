@@ -149,3 +149,46 @@ def test_reason_code_helpers_accept_reasoncode_and_int():
     assert _is_auth_failure(4) and _is_auth_failure(5)
     assert not _is_auth_failure(SERVER_UNAVAILABLE) and not _is_auth_failure(0)
     assert not _is_auth_failure(None) and not _is_success(None)
+
+
+def test_error_callback_that_unregisters_itself_does_not_skip_the_next(mock_client):
+    device = DummyDevice()
+    client = make_client(device, max_auth_retries=0)
+    received = []
+
+    def first(error):
+        received.append("first")
+        client.remove_error_callback(first)
+
+    def second(error):
+        received.append("second")
+
+    client.add_error_callback(first)
+    client.add_error_callback(second)
+
+    client.connect()
+    connack(client, mock_client, BAD_CREDENTIALS)
+
+    assert received == ["first", "second"]
+    assert client._error_callbacks == [second]
+
+
+def test_connection_callback_that_unregisters_itself_does_not_skip_the_next(mock_client):
+    device = DummyDevice()
+    client = make_client(device, max_auth_retries=5)
+    received = []
+
+    def first(connected):
+        received.append(("first", connected))
+        client.remove_connection_callback(first)
+
+    def second(connected):
+        received.append(("second", connected))
+
+    client.add_connection_callback(first)
+    client.add_connection_callback(second)
+
+    client.connect()
+    connack(client, mock_client, BAD_CREDENTIALS)
+
+    assert received == [("first", False), ("second", False)]
