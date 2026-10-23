@@ -63,12 +63,18 @@ class BaseDevice(ABC):
         self._state_timer_stop_event = threading.Event()
         self._status0_timer_stop_event = threading.Event()
 
-        # Worker for the on-connect STATUS0 send, and cached host information
-        self._status0_connect_thread: Optional[threading.Thread] = None
-        self._status0_worker_lock = threading.Lock()
-        self._status0_resend_pending = False
+        # One persistent sender thread for the on-connect STATUS0, driven by an
+        # event: every (re)connect sets the event, the sender loops on it, so a
+        # request can never be lost at a thread boundary. Cached host info is
+        # tagged with a generation that every connect bumps, so a lookup that
+        # was in flight across a reconnect cannot repopulate the cache.
+        self._status0_lock = threading.Lock()
+        self._status0_sender_thread: Optional[threading.Thread] = None
+        self._status0_request = threading.Event()
+        self._status0_stop: Optional[threading.Event] = None
         self._net_info: Optional[Dict[str, str]] = None
         self._net_info_at: float = 0.0
+        self._net_info_generation = 0
         
         self._startup_utc = datetime.utcnow()
         self._boot_count = 1
@@ -152,14 +158,19 @@ class BaseDevice(ABC):
                       self._status0_timer_thread]:
             if thread:
                 thread.join()
-        # Take the worker reference under the lock that on_connected() holds
-        # while creating and starting it, so it is never joined before start()
-        with self._status0_worker_lock:
-            worker = self._status0_connect_thread
-            self._status0_connect_thread = None
-        if worker is not None and worker is not threading.current_thread():
+        # Stop the STATUS0 sender: take it under the lock on_connected() holds
+        # while starting it, signal its own stop event, join outside the lock.
+        with self._status0_lock:
+            sender = self._status0_sender_thread
+            stop = self._status0_stop
+            self._status0_sender_thread = None
+            self._status0_stop = None
+            if stop is not None:
+                stop.set()
+                self._status0_request.set()
+        if sender is not None and sender is not threading.current_thread():
             # Bounded: it may be inside a slow host lookup; daemon anyway
-            worker.join(timeout=5.0)
+            sender.join(timeout=5.0)
                 
         # Reset events and threads
         self._sensor_timer_stop_event.clear()
@@ -253,53 +264,59 @@ class BaseDevice(ABC):
         must not do this itself: timers may start before the CONNACK has
         arrived, and a message sent then is dropped.
 
-        Runs on paho's network thread (or a timer thread), so the actual send
-        is handed to a short-lived worker: collecting host information can
-        block on DNS or on getmac shelling out, and that must not stall MQTT
-        processing or keepalives. Returns immediately.
+        Runs on paho's network thread (or a timer thread), so the send is
+        requested from a persistent sender thread and this returns at once:
+        collecting host information can block on DNS or on getmac shelling
+        out, and that must not stall MQTT processing or keepalives. The
+        request is an event the sender loops on, so a reconnect arriving while
+        a send is in flight, or at any thread boundary, is never lost.
         """
-        # A new connection may come with a new address: re-resolve on the worker
-        self._net_info = None
+        with self._status0_lock:
+            # A new connection may come with a new address: invalidate the
+            # cache and make any lookup still in flight unable to repopulate it
+            self._net_info_generation += 1
+            self._net_info = None
+            self._status0_request.set()
+            sender = self._status0_sender_thread
+            if sender is None or not sender.is_alive():
+                stop = threading.Event()
+                sender = threading.Thread(
+                    target=self._status0_sender,
+                    args=(stop,),
+                    name=f"{self.__class__.__name__}Status0OnConnect",
+                    daemon=True,
+                )
+                sender.start()
+                self._status0_sender_thread = sender
+                self._status0_stop = stop
 
-        def _send():
-            while True:
-                try:
-                    self.publish_status0_data()
-                except Exception:
-                    _logger.exception("STATUS0 on connect failed")
-                with self._status0_worker_lock:
-                    if not self._status0_resend_pending:
-                        return
-                    # A reconnect came in while we were sending (possibly a
-                    # dropped attempt on the old connection): send again.
-                    self._status0_resend_pending = False
-
-        with self._status0_worker_lock:
-            previous = self._status0_connect_thread
-            if previous is not None and previous.is_alive():
-                # A send is still in flight; have that worker send once more
-                # before it exits rather than starting a second one.
-                self._status0_resend_pending = True
+    def _status0_sender(self, stop: threading.Event):
+        """Send STATUS0 whenever requested, until this sender's stop is set."""
+        while True:
+            self._status0_request.wait()
+            if stop.is_set():
                 return
-            self._status0_resend_pending = False
-            worker = threading.Thread(
-                target=_send, name=f"{self.__class__.__name__}Status0OnConnect", daemon=True
-            )
-            worker.start()
-            self._status0_connect_thread = worker
+            self._status0_request.clear()
+            try:
+                self.publish_status0_data()
+            except Exception:
+                _logger.exception("STATUS0 on connect failed")
 
     def _get_net_info(self) -> Dict[str, str]:
         """Hostname, IP and MAC, cached for NET_INFO_TTL and cleared on connect.
 
         The lookups can block (DNS, getmac subprocesses), so they are done on
-        the STATUS0 worker or timer thread, never on the MQTT thread, and not
-        more often than needed. Failures fall back to placeholders and are
-        retried on the next call.
+        the STATUS0 sender or timer thread, never on the MQTT thread, and not
+        more often than needed. A result is cached only if no (re)connect
+        happened while it was being collected, so a slow lookup cannot bring
+        back pre-reconnect information. Failures fall back to placeholders and
+        are retried on the next call.
         """
-        # Capture once: on_connected() may clear the cache from another thread
-        # between the check and the return.
-        cached = self._net_info
-        if cached is not None and time.monotonic() - self._net_info_at < NET_INFO_TTL:
+        with self._status0_lock:
+            cached = self._net_info
+            cached_at = self._net_info_at
+            generation = self._net_info_generation
+        if cached is not None and time.monotonic() - cached_at < NET_INFO_TTL:
             return cached
         hostname = socket.gethostname()
         try:
@@ -318,8 +335,10 @@ class BaseDevice(ABC):
             "Mac": mac or "",
         }
         if ip_address is not None and mac:
-            self._net_info = info
-            self._net_info_at = time.monotonic()
+            with self._status0_lock:
+                if generation == self._net_info_generation:
+                    self._net_info = info
+                    self._net_info_at = time.monotonic()
         return info
 
     def _start_status0_timer(self):

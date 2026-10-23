@@ -311,9 +311,7 @@ def test_net_info_survives_invalidation_during_the_cache_check(monkeypatch):
 
 
 def test_reconnect_while_worker_is_finishing_still_sends_status0():
-    """Regression: a reconnect arriving while the previous worker is still
-    finishing (e.g. a dropped attempt on the old connection) must not lose
-    its STATUS0 until the hourly timer."""
+    """A reconnect arriving while a send is in flight must not be lost."""
     dev = TickDevice(0.5)
     attempts = []
     first_attempt_started = threading.Event()
@@ -323,17 +321,73 @@ def test_reconnect_while_worker_is_finishing_still_sends_status0():
         attempts.append(threading.current_thread().name)
         if len(attempts) == 1:
             first_attempt_started.set()
-            release_first_attempt.wait(timeout=2.0)   # "dropped" send still in flight
+            release_first_attempt.wait(timeout=2.0)   # send still in flight
 
     dev.publish_status0_data = publish
     dev.on_connected()                                   # first connection
     assert first_attempt_started.wait(timeout=2.0)
-    dev.on_connected()                                   # reconnect while worker busy
+    dev.on_connected()                                   # reconnect while busy
     release_first_attempt.set()
     assert _wait_for(lambda: len(attempts) == 2)
+    time.sleep(0.05)
     dev.stop_timers()
     assert len(attempts) == 2                            # exactly one resend, no burst
-    assert len({name for name in attempts}) == 1         # same single worker
+    assert len(set(attempts)) == 1                       # same single sender thread
+
+
+def test_reconnect_right_after_a_send_completed_is_not_lost():
+    """Regression for the exit-boundary race of the one-shot worker: a request
+    arriving after the sender finished its last send must still be served."""
+    dev = TickDevice(0.5)
+    attempts = []
+    dev.publish_status0_data = lambda: attempts.append(time.monotonic())
+
+    dev.on_connected()
+    assert _wait_for(lambda: len(attempts) == 1)
+    for _ in range(3):                                   # idle sender, repeated reconnects
+        before = len(attempts)
+        dev.on_connected()
+        assert _wait_for(lambda: len(attempts) == before + 1)
+    dev.stop_timers()
+    assert len(attempts) == 4
+
+
+def test_stop_then_reconnect_restarts_the_sender():
+    dev = TickDevice(0.5)
+    attempts = []
+    dev.publish_status0_data = lambda: attempts.append(1)
+    dev.on_connected()
+    assert _wait_for(lambda: len(attempts) == 1)
+    dev.stop_timers()
+    assert dev._status0_sender_thread is None
+    dev.on_connected()
+    assert _wait_for(lambda: len(attempts) == 2)
+    dev.stop_timers()
+
+
+def test_lookup_in_flight_across_a_reconnect_does_not_repopulate_cache(monkeypatch):
+    """Regression: resolve the old IP, block in getmac, reconnect clears the
+    cache, then the lookup finishes. The stale result must not be cached."""
+    import qilowatt.base_device as bd
+
+    addresses = iter(["10.0.0.5", "10.0.0.6"])
+    monkeypatch.setattr(bd.socket, "gethostbyname", lambda name: next(addresses))
+    dev = TickDevice(0.5)
+    dev.publish_status0_data = lambda: None               # keep the sender trivial
+
+    def mac_with_reconnect_in_the_middle(*args, **kwargs):
+        dev.on_connected()                               # lands mid-lookup
+        return "aa:bb:cc:dd:ee:ff"
+
+    monkeypatch.setattr(bd.getmac, "get_mac_address", mac_with_reconnect_in_the_middle)
+    first = dev.get_status0_data().to_dict()["StatusNET"]
+    assert first["IPAddress"] == "10.0.0.5"              # this call reports what it resolved
+    assert dev._net_info is None                         # but the stale result is not cached
+
+    monkeypatch.setattr(bd.getmac, "get_mac_address", lambda *a, **k: "aa:bb:cc:dd:ee:ff")
+    second = dev.get_status0_data().to_dict()["StatusNET"]
+    assert second["IPAddress"] == "10.0.0.6"             # re-resolved after the reconnect
+    dev.stop_timers()
 
 
 def test_net_info_failure_falls_back_and_retries(monkeypatch):
