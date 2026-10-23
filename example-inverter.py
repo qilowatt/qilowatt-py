@@ -103,16 +103,26 @@ metrics_data = MetricsData(
     # GenVoltage / GenPower / GenCurrent default to zeros when there is no generator
 )
 
-# Setting both starts the periodic publishing (SENSOR every 10 s, STATE every 60 s)
-device.set_energy_data(energy_data)
-device.set_metrics_data(metrics_data)
+
+def read_inverter():
+    """Called by the device on its own 10 s grid, right before each SENSOR publish.
+
+    Read your real inverter here. Returning fresh data each time keeps every
+    payload current without touching the publish cadence. (The alternative,
+    pushing with device.set_energy_data() / set_metrics_data(), still works.)
+    """
+    energy_data.Today += 0.01
+    return energy_data, metrics_data
+
+
+# Registering a provider starts the periodic publishing
+# (SENSOR every 10 s, STATE every 60 s, STATUS0 at startup then hourly)
+device.set_data_provider(read_inverter)
 
 try:
     print("Running. Press Ctrl+C to exit.")
     while not fatal_error.wait(30):
-        # Simulate updating data periodically
-        energy_data.Today += 0.1
-        device.set_energy_data(energy_data)
+        pass
     print(f"Stopped: {client.last_error()}")
     raise SystemExit(1)
 except KeyboardInterrupt:

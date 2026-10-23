@@ -27,11 +27,11 @@ pytest tests/test_client_auth.py::test_authentication_failure_triggers_retry
 
 - **BaseDevice** (`src/qilowatt/base_device.py`): Abstract base class for all device types. Manages:
   - MQTT topic patterns (`Q/{device_id}/SENSOR`, `Q/{device_id}/STATE`, `Q/{device_id}/STATUS0`, `Q/{device_id}/cmnd/backlog`)
-  - Automatic timer-based publishing (sensor: 10s, state: 60s, status0: startup + hourly)
+  - Automatic timer-based publishing on a fixed monotonic grid (sensor: 10s, state: 60s, status0: startup + hourly). The Qilowatt backend expects SENSOR exactly 10 s apart, so the schedule is anchored (no drift) and late slots are skipped, never burst.
   - Status0 system information collection
 
 - **Device implementations** (`src/qilowatt/devices/`):
-  - `InverterDevice`: Handles ENERGY/METRICS data and WORKMODE commands. Supports power limiting via `set_max_energy_power()` and `set_max_battery_power()`.
+  - `InverterDevice`: Handles ENERGY/METRICS data and WORKMODE commands. Data can be pushed with `set_energy_data()`/`set_metrics_data()` or, preferably, pulled via `set_data_provider()` right before each publish so every payload is fresh. Supports power limiting via `set_max_energy_power()` and `set_max_battery_power()`.
   - `SwitchDevice`: Simple on/off switch with POWER1 commands.
 
 ### Data Flow

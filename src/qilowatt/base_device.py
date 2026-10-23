@@ -1,7 +1,9 @@
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, Callable
+import math
 import threading
 import logging
+import time
 from datetime import datetime, timezone
 from .models import (
     Status0Data,
@@ -14,11 +16,40 @@ import getmac
 
 _logger = logging.getLogger(__name__)
 
+SENSOR_INTERVAL = 10.0   # seconds; the Qilowatt backend expects SENSOR exactly this far apart
+STATE_INTERVAL = 60.0
+STATUS0_INTERVAL = 3600.0
+
+# After a publish, the next grid slot must be at least this fraction of an
+# interval after the publish *finished*. Normal publishes take milliseconds, so
+# this never triggers in steady state and the schedule stays exactly on the
+# grid; it only skips slots after a disruption (a stalled publish, a suspended
+# host), so two messages are never sent close together.
+MIN_SPACING_FRACTION = 0.9
+
+
+def _check_interval(name: str, value: float) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise TypeError(f"{name} must be a number of seconds, got {value!r}")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number of seconds, got {value!r}")
+    return float(value)
+
+
 class BaseDevice(ABC):
     """Base class for all devices that can communicate via MQTT."""
     
-    def __init__(self, device_id: str):
+    def __init__(
+        self,
+        device_id: str,
+        sensor_interval: float = SENSOR_INTERVAL,
+        state_interval: float = STATE_INTERVAL,
+        status0_interval: float = STATUS0_INTERVAL,
+    ):
         self.device_id = device_id
+        self._sensor_interval = _check_interval("sensor_interval", sensor_interval)
+        self._state_interval = _check_interval("state_interval", state_interval)
+        self._status0_interval = _check_interval("status0_interval", status0_interval)
         self._data_initialized = False
         self._sensor_timer_thread: Optional[threading.Thread] = None
         self._state_timer_thread: Optional[threading.Thread] = None
@@ -124,21 +155,53 @@ class BaseDevice(ABC):
         # Ensure VERSION is always present even if device doesn't provide it
         if not isinstance(sensor_data, dict):
             sensor_data = {}
+        if not sensor_data:
+            # Nothing to send yet (e.g. a data provider has not produced data)
+            return
         if "VERSION" not in sensor_data:
             sensor_data["VERSION"] = self.get_version_data()
         # Callback will be set by client
         if hasattr(self, '_publish_callback'):
             self._publish_callback(self.sensor_topic, sensor_data)
 
+    def _run_on_grid(self, stop_event: threading.Event, interval: float,
+                     action: Callable[[], None], run_immediately: bool = False):
+        """Run action every `interval` seconds on a fixed grid until stop_event is set.
+
+        The schedule is anchored to a monotonic clock, so the time spent inside
+        action (reading data, serialising, publishing) does not accumulate into
+        drift: the n-th run is due at start + n * interval. After each run the
+        next slot is chosen so that it lies at least MIN_SPACING_FRACTION of an
+        interval after the run *finished*: a stalled publish or a late wake-up
+        (suspended host) therefore skips the missed slots instead of being
+        followed by another message a few seconds later. An exception in action
+        is logged and does not stop the timer.
+        """
+        def _safe_action():
+            try:
+                action()
+            except Exception:
+                _logger.exception("Periodic publish failed; will retry on the next slot")
+
+        min_spacing = interval * MIN_SPACING_FRACTION
+        if run_immediately:
+            _safe_action()
+        next_at = time.monotonic() + interval
+        while True:
+            if stop_event.wait(max(0.0, next_at - time.monotonic())):
+                return
+            _safe_action()
+            finished = time.monotonic()
+            next_at += interval
+            while next_at < finished + min_spacing:
+                next_at += interval
+
     def _start_sensor_timer(self):
-        """Start timer for sending sensor data."""
-        def sensor_timer():
-            while not self._sensor_timer_stop_event.wait(10):
-                self.publish_sensor_data()
-                    
+        """Start timer for sending sensor data on a fixed grid."""
         self._sensor_timer_thread = threading.Thread(
-            target=sensor_timer, 
-            name=f"{self.__class__.__name__}SensorTimer"
+            target=self._run_on_grid,
+            args=(self._sensor_timer_stop_event, self._sensor_interval, self.publish_sensor_data),
+            name=f"{self.__class__.__name__}SensorTimer",
         )
         self._sensor_timer_thread.daemon = True
         self._sensor_timer_thread.start()
@@ -150,33 +213,26 @@ class BaseDevice(ABC):
 
     def _start_state_timer(self):
         """Start timer for sending state data."""
-        def state_timer():
-            while not self._state_timer_stop_event.wait(60):
-                self.publish_state_data()
-
         self._state_timer_thread = threading.Thread(
-            target=state_timer, 
-            name=f"{self.__class__.__name__}StateTimer"
+            target=self._run_on_grid,
+            args=(self._state_timer_stop_event, self._state_interval, self.publish_state_data),
+            name=f"{self.__class__.__name__}StateTimer",
         )
         self._state_timer_thread.daemon = True
         self._state_timer_thread.start()
 
+    def publish_status0_data(self):
+        status0_data = self.get_status0_data()
+        if hasattr(self, '_publish_callback'):
+            self._publish_callback(self.status0_topic, status0_data.to_dict())
+
     def _start_status0_timer(self):
-        """Start timer for sending status data."""
-        def status0_timer():
-            # Send at startup
-            status0_data = self.get_status0_data()
-            if hasattr(self, '_publish_callback'):
-                self._publish_callback(self.status0_topic, status0_data.to_dict())
-            # Then every 60 minutes
-            while not self._status0_timer_stop_event.wait(3600):
-                status0_data = self.get_status0_data()
-                if hasattr(self, '_publish_callback'):
-                    self._publish_callback(self.status0_topic, status0_data.to_dict())
-                    
+        """Start timer for sending status data: at startup, then hourly."""
         self._status0_timer_thread = threading.Thread(
-            target=status0_timer, 
-            name=f"{self.__class__.__name__}Status0Timer"
+            target=self._run_on_grid,
+            args=(self._status0_timer_stop_event, self._status0_interval, self.publish_status0_data),
+            kwargs={"run_immediately": True},
+            name=f"{self.__class__.__name__}Status0Timer",
         )
         self._status0_timer_thread.daemon = True
         self._status0_timer_thread.start()
