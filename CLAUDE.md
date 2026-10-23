@@ -23,7 +23,7 @@ pytest tests/test_client_auth.py::test_authentication_failure_triggers_retry
 
 ### Core Components
 
-- **QilowattMQTTClient** (`src/qilowatt/client.py`): Main MQTT client handling connection, authentication with retry logic, and message routing. Manages TLS connection to `mqtt.qilowatt.it:8883`.
+- **QilowattMQTTClient** (`src/qilowatt/client.py`): Main MQTT client handling connection, authentication with retry logic, and message routing. Manages TLS connection to `mqtt.qilowatt.it:8883`, verifying the broker's certificate (Let's Encrypt) against certifi's bundle.
 
 - **BaseDevice** (`src/qilowatt/base_device.py`): Abstract base class for all device types. Manages:
   - MQTT topic patterns (`Q/{device_id}/SENSOR`, `Q/{device_id}/STATE`, `Q/{device_id}/STATUS0`, `Q/{device_id}/cmnd/backlog`)

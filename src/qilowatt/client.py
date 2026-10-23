@@ -1,6 +1,6 @@
 # qilowatt/client.py
 
-import ssl
+import certifi
 import json
 import threading
 from collections import deque
@@ -187,8 +187,13 @@ class QilowattMQTTClient:
 
     def _setup_client(self):
         if self.tls:
-            self._client.tls_set(cert_reqs=ssl.CERT_NONE)
-            self._client.tls_insecure_set(True)
+            # Verify the broker's certificate chain and host name, so the
+            # credentials and the WORKMODE stream cannot be captured by an
+            # impostor on the network path. The broker presents a Let's
+            # Encrypt certificate; certifi's bundle (Home Assistant ships it)
+            # is used rather than the system store so this works the same on
+            # every platform. paho defaults to CERT_REQUIRED + check_hostname.
+            self._client.tls_set(ca_certs=certifi.where())
 
         self._client.username_pw_set(self.mqtt_username, self.mqtt_password)
         self._client.on_connect = self._on_connect

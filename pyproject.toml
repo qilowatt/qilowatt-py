@@ -30,6 +30,7 @@ classifiers = [
 
 dependencies = [
     "paho-mqtt>=2.0.0",
+    "certifi",
     "getmac>=0.8.3",
 ]
 
