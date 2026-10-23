@@ -12,10 +12,15 @@
 
 import logging
 import os
+import sys
 import threading
 import time
 
-from qilowatt import AuthenticationError, EnergyData, InverterDevice, MetricsData, QilowattMQTTClient
+# Run against this checkout's source rather than whatever qilowatt version is
+# installed in the environment, so the example always matches the repo.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+
+from qilowatt import AuthenticationError, EnergyData, InverterDevice, MetricsData, QilowattMQTTClient  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
