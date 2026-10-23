@@ -321,7 +321,7 @@ def test_data_provider_is_pulled_right_before_each_publish(monkeypatch):
     assert second["METRICS"]["BatterySOC"] == [2]
 
 
-def test_data_provider_failure_falls_back_to_last_data(monkeypatch):
+def test_data_provider_failure_skips_instead_of_repeating_old_data(monkeypatch):
     dev = InverterDevice("DEV")
     monkeypatch.setattr(dev, "start_timers", lambda: None)
     state = {"fail": False}
@@ -335,6 +335,9 @@ def test_data_provider_failure_falls_back_to_last_data(monkeypatch):
     assert dev.get_sensor_data()["METRICS"]["BatterySOC"] == [42]
 
     state["fail"] = True
+    assert dev.get_sensor_data() == {}
+
+    state["fail"] = False
     assert dev.get_sensor_data()["METRICS"]["BatterySOC"] == [42]
 
 
@@ -371,3 +374,36 @@ def test_push_api_unchanged_without_provider(monkeypatch):
     dev.set_energy_data(_energy())
     dev.set_metrics_data(_metrics(soc=5))
     assert dev.get_sensor_data()["METRICS"]["BatterySOC"] == [5]
+
+
+def test_provider_without_data_skips_the_slot(monkeypatch):
+    """(None, None) from the provider skips the publish; stale data is never repeated."""
+    dev = InverterDevice("DEV")
+    monkeypatch.setattr(dev, "start_timers", lambda: None)
+    published = []
+    dev.set_publish_callback(lambda topic, data: published.append(data))
+    state = {"data": (_energy(), _metrics(soc=42))}
+    dev.set_data_provider(lambda: state["data"])
+
+    dev.publish_sensor_data()
+    assert published[-1]["METRICS"]["BatterySOC"] == [42]
+
+    state["data"] = (None, None)          # source entities went unavailable
+    for _ in range(3):
+        dev.publish_sensor_data()
+    assert len(published) == 1            # nothing repeated, nothing invented
+
+    state["data"] = (_energy(), _metrics(soc=43))
+    dev.publish_sensor_data()
+    assert len(published) == 2 and published[-1]["METRICS"]["BatterySOC"] == [43]
+
+
+def test_provider_exception_is_logged_once_per_outage(monkeypatch, caplog):
+    dev = InverterDevice("DEV")
+    monkeypatch.setattr(dev, "start_timers", lambda: None)
+    dev.set_data_provider(lambda: (_ for _ in ()).throw(RuntimeError("not ready")))
+    with caplog.at_level("WARNING", logger="qilowatt.devices.inverter"):
+        for _ in range(5):
+            dev.get_sensor_data()
+    assert sum("Data provider failed" in r.message for r in caplog.records) == 1
+    assert sum("skipping SENSOR publishes" in r.message for r in caplog.records) == 1

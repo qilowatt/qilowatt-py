@@ -31,7 +31,7 @@ pytest tests/test_client_auth.py::test_authentication_failure_triggers_retry
   - Status0 system information collection
 
 - **Device implementations** (`src/qilowatt/devices/`):
-  - `InverterDevice`: Handles ENERGY/METRICS data and WORKMODE commands. Data can be pushed with `set_energy_data()`/`set_metrics_data()` or, preferably, pulled via `set_data_provider()` right before each publish so every payload is fresh. Supports power limiting via `set_max_energy_power()` and `set_max_battery_power()`.
+  - `InverterDevice`: Handles ENERGY/METRICS data and WORKMODE commands. Data can be pushed with `set_energy_data()`/`set_metrics_data()` or, preferably, pulled via `set_data_provider()` right before each publish so every payload is fresh. A provider that returns `(None, None)` or raises (source unavailable) makes that SENSOR slot be skipped; stale data is never re-published. Supports power limiting via `set_max_energy_power()` and `set_max_battery_power()`.
   - `SwitchDevice`: Simple on/off switch with POWER1 commands.
 
 ### Data Flow
