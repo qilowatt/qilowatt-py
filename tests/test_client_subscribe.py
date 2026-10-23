@@ -4,6 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import paho.mqtt.client as mqtt
 import pytest
+from paho.mqtt.packettypes import PacketTypes
+from paho.mqtt.reasoncodes import ReasonCode
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -257,3 +259,111 @@ def test_subscribe_failure_retries(patched_environment):
     assert client._subscribed is True
 
     client.disconnect()
+
+
+def _paho_invokes_on_disconnect(client, mock_client):
+    """Make the mocked paho disconnect() call back into _on_disconnect synchronously,
+    as the real one does once the network loop has been stopped."""
+    def side_effect(*args, **kwargs):
+        client._on_disconnect(mock_client, None, MagicMock(), 0, None)
+        return mqtt.MQTT_ERR_SUCCESS
+    mock_client.disconnect.side_effect = side_effect
+
+
+def test_disconnect_stops_loop_even_without_connack(patched_environment):
+    """TCP/TLS up but the broker never answered: the loop thread must still stop,
+    and no "disconnected" notification is emitted for a connection that never came up."""
+    mock_client = patched_environment
+    mock_client.is_connected.return_value = False  # no CONNACK ever arrived
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    states = []
+    client.add_connection_callback(states.append)
+    _paho_invokes_on_disconnect(client, mock_client)
+
+    client.connect()
+    mock_client.loop_start.assert_called_once()
+    assert client.connected is False
+
+    client.disconnect()
+
+    mock_client.loop_stop.assert_called_once()
+    mock_client.disconnect.assert_called_once()
+    assert client._shutdown is True
+    assert device.stop_called is True
+    assert states == []
+
+
+def test_disconnect_notifies_connected_client_exactly_once(patched_environment):
+    """paho's synchronous _on_disconnect plus our own notification must not double up."""
+    mock_client = patched_environment
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    states = []
+    client.add_connection_callback(states.append)
+    _paho_invokes_on_disconnect(client, mock_client)
+
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+    client._on_subscribe(mock_client, None, 1, [0], None)
+    assert states == [True]
+
+    client.disconnect()
+
+    assert states == [True, False]
+    assert client.connected is False
+
+
+def test_unexpected_disconnect_still_notifies_once(patched_environment):
+    """A broker-initiated drop on a connected client notifies listeners (once)."""
+    mock_client = patched_environment
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    states = []
+    client.add_connection_callback(states.append)
+
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+    client._on_subscribe(mock_client, None, 1, [0], None)
+    client._on_disconnect(mock_client, None, MagicMock(), 7, None)
+    client._on_disconnect(mock_client, None, MagicMock(), 7, None)  # paho can repeat it
+
+    assert states == [True, False]
+
+
+def test_disconnect_does_not_hold_lock_while_joining_network_thread(patched_environment):
+    """Regression: loop_stop() joins the network thread; if that thread is inside
+    _handle_authentication_failure() waiting for client._lock, holding the lock
+    across loop_stop() deadlocks."""
+    import threading
+
+    mock_client = patched_environment
+    mock_client.is_connected.return_value = False
+    device = DummyDevice()
+    client = QilowattMQTTClient(
+        mqtt_username="u", mqtt_password="p", device=device, max_auth_retries=0
+    )
+    client.connect()
+
+    rejected = ReasonCode(PacketTypes.CONNACK, "Not authorized")
+    joined = {"ok": False}
+    entered = {"once": False}
+
+    def loop_stop_joining_network_thread(*args, **kwargs):
+        # First call comes from disconnect(); the auth handler calls loop_stop()
+        # again from inside the network thread, which must not recurse here.
+        if entered["once"]:
+            return mqtt.MQTT_ERR_SUCCESS
+        entered["once"] = True
+        network_thread = threading.Thread(
+            target=client._on_connect, args=(mock_client, None, MagicMock(), rejected, None)
+        )
+        network_thread.start()
+        network_thread.join(timeout=2.0)
+        joined["ok"] = not network_thread.is_alive()
+        return mqtt.MQTT_ERR_SUCCESS
+
+    mock_client.loop_stop.side_effect = loop_stop_joining_network_thread
+
+    client.disconnect()
+
+    assert joined["ok"], "network thread blocked on client._lock while loop_stop() joined it"
+    assert client._shutdown is True

@@ -205,8 +205,7 @@ class QilowattMQTTClient:
         else:
             error = ConnectionError(f"Connection failed with result code {reason_code}")
             self._last_error = error
-            self._connected = False
-            self._notify_connection_change(False)
+            self._set_disconnected()
             _logger.error(str(error))
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties):
@@ -214,8 +213,21 @@ class QilowattMQTTClient:
         self._cancel_subscribe_timer()
         self._subscribed = False
         self._pending_subscribe_mid = None
+        self._set_disconnected()
+
+    def _set_disconnected(self) -> bool:
+        """Mark the client disconnected; notify listeners only on an actual change.
+
+        Returns True if the client had been connected. Keeps a connection that
+        never came up, or one already torn down, from emitting a spurious
+        "disconnected" notification.
+        """
+        was_connected = self._connected
         self._connected = False
-        self._notify_connection_change(False)
+        self._subscribed = False
+        if was_connected:
+            self._notify_connection_change(False)
+        return was_connected
 
     def _on_message(self, client, userdata, msg):
         _logger.debug(f"Message received on {msg.topic}: {msg.payload}")
@@ -312,16 +324,39 @@ class QilowattMQTTClient:
                 self._client.loop_start()
 
     def disconnect(self):
-        """Disconnect from the MQTT broker and stop the loop."""
+        """Disconnect from the MQTT broker and stop the loop.
+
+        Always stops paho's network loop, even when no CONNACK was ever
+        received: after connect() the loop thread and socket exist as soon as
+        TCP/TLS is up, and a broker that never answers would otherwise leave
+        them running. Both paho calls are no-ops when nothing was started.
+
+        The lock is released before loop_stop(): it joins the network thread,
+        and that thread may itself be waiting for the lock inside
+        _handle_authentication_failure(). Listeners are notified once, here,
+        and only if the client had actually been connected; paho invokes
+        _on_disconnect() synchronously from disconnect() once the loop is
+        stopped, and that path no longer notifies for an already-cleared state.
+        """
         with self._lock:
             self._shutdown = True
             self._cancel_subscribe_timer()
-            if self._connected or self._client.is_connected():
-                self._client.loop_stop()
-                self._client.disconnect()
-                self._connected = False
-                self._subscribed = False
-                self._notify_connection_change(False)
+            self._pending_subscribe_mid = None
+            was_connected = self._connected
+            self._connected = False
+            self._subscribed = False
+
+        try:
+            self._client.loop_stop()
+        except Exception as exc:
+            _logger.debug("loop_stop during disconnect: %s", exc)
+        try:
+            self._client.disconnect()
+        except Exception as exc:
+            _logger.debug("disconnect during disconnect: %s", exc)
+
+        if was_connected:
+            self._notify_connection_change(False)
         self.device.stop_timers()
 
     def last_error(self) -> Optional[Exception]:
@@ -336,8 +371,7 @@ class QilowattMQTTClient:
         exceeded. Stopping is final: callers must create a new connection
         after fixing the credentials.
         """
-        self._connected = False
-        self._notify_connection_change(False)
+        self._set_disconnected()
         self._auth_failures += 1
 
         if self._auth_failures <= self._max_auth_retries:
