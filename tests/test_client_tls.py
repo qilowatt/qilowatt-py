@@ -11,8 +11,22 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from qilowatt.base_device import BaseDevice
 from qilowatt.client import QilowattMQTTClient
-from tests.test_client_auth import DummyDevice
+
+
+class DummyDevice(BaseDevice):
+    def __init__(self):
+        super().__init__(device_id="DEVICE123")
+
+    def handle_command(self, payload: bytes) -> None:  # pragma: no cover - not used here
+        pass
+
+    def get_sensor_data(self):  # pragma: no cover - not used here
+        return {}
+
+    def get_state_data(self):  # pragma: no cover - not used here
+        return {}
 
 
 def test_tls_verifies_certificate_chain_and_host_name():
