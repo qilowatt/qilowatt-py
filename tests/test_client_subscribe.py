@@ -257,3 +257,26 @@ def test_subscribe_failure_retries(patched_environment):
     assert client._subscribed is True
 
     client.disconnect()
+
+
+def test_disconnect_stops_loop_even_without_connack(patched_environment):
+    """TCP/TLS up but the broker never answered: the loop thread must still stop."""
+    mock_client = patched_environment
+    mock_client.is_connected.return_value = False  # no CONNACK ever arrived
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    states = []
+    client.add_connection_callback(states.append)
+
+    client.connect()
+    mock_client.loop_start.assert_called_once()
+    assert client.connected is False
+
+    client.disconnect()
+
+    mock_client.loop_stop.assert_called_once()
+    mock_client.disconnect.assert_called_once()
+    assert client._shutdown is True
+    assert device.stop_called is True
+    # No "disconnected" notification for a connection that never came up
+    assert states == []

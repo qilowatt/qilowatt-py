@@ -312,15 +312,28 @@ class QilowattMQTTClient:
                 self._client.loop_start()
 
     def disconnect(self):
-        """Disconnect from the MQTT broker and stop the loop."""
+        """Disconnect from the MQTT broker and stop the loop.
+
+        Always stops paho's network loop, even when no CONNACK was ever
+        received: after connect() the loop thread and socket exist as soon as
+        TCP/TLS is up, and a broker that never answers would otherwise leave
+        them running. Both paho calls are no-ops when nothing was started.
+        """
         with self._lock:
             self._shutdown = True
             self._cancel_subscribe_timer()
-            if self._connected or self._client.is_connected():
+            was_connected = self._connected
+            try:
                 self._client.loop_stop()
+            except Exception as exc:
+                _logger.debug("loop_stop during disconnect: %s", exc)
+            try:
                 self._client.disconnect()
-                self._connected = False
-                self._subscribed = False
+            except Exception as exc:
+                _logger.debug("disconnect during disconnect: %s", exc)
+            self._connected = False
+            self._subscribed = False
+            if was_connected:
                 self._notify_connection_change(False)
         self.device.stop_timers()
 
