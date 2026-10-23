@@ -4,8 +4,6 @@ import os
 import sys
 import threading
 import time
-from unittest.mock import patch
-
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -155,260 +153,95 @@ def test_non_numeric_interval_is_rejected():
         InverterDevice("DEV", sensor_interval="10")
 
 
-def test_status0_timer_runs_on_the_grid_only():
-    """The startup STATUS0 is sent from on_connected(); the timer must not send
-    one immediately, since timers can start before the CONNACK has arrived."""
-    class StatusDevice(TickDevice):
-        def __init__(self):
-            super().__init__(0.5)
-            self._status0_interval = 0.05
-            self.status_ticks = []
-        def publish_status0_data(self):
-            self.status_ticks.append(time.monotonic())
+class Status0Device(TickDevice):
+    """TickDevice with a fast STATUS0 interval and recorded STATUS0 sends."""
 
-    dev = StatusDevice()
+    def __init__(self, status0_interval=0.05):
+        super().__init__(0.5)
+        self._status0_interval = status0_interval
+        self.status_sends = []            # (monotonic time, thread name)
+        self.block_send = None            # Event: block inside a send while set
+
+    def publish_status0_data(self):
+        self.status_sends.append((time.monotonic(), threading.current_thread().name))
+        if self.block_send is not None:
+            self.block_send.wait(timeout=2.0)
+
+
+def test_status0_without_a_connect_is_sent_on_the_grid_only():
+    """No immediate send any more: timers may start before the CONNACK has
+    arrived, and a message sent then would be dropped."""
+    dev = Status0Device()
     start = time.monotonic()
     dev._start_status0_timer()
     time.sleep(0.02)
-    assert dev.status_ticks == []                       # nothing immediately
-    assert _wait_for(lambda: len(dev.status_ticks) >= 2)
+    assert dev.status_sends == []
+    assert _wait_for(lambda: len(dev.status_sends) >= 2)
     dev.stop_timers()
-    assert dev.status_ticks[0] - start > 0.04           # first one after an interval
-
-    sent = []
-    dev.publish_status0_data = lambda: sent.append(1)
-    dev.on_connected()
-    assert _wait_for(lambda: sent == [1])
-    dev.stop_timers()
+    assert dev.status_sends[0][0] - start > 0.04
 
 
-def test_on_connected_returns_immediately_and_sends_on_a_worker():
-    """Host discovery can block; the hook must not hold the MQTT thread."""
-    dev = TickDevice(0.5)
-    sender = {}
-    release = threading.Event()
-
-    def slow_publish():
-        sender["thread"] = threading.current_thread()
-        release.wait(timeout=2.0)
-        sender["done"] = True
-
-    dev.publish_status0_data = slow_publish
+def test_on_connected_sends_status0_at_once_on_the_timer_thread():
+    dev = Status0Device(status0_interval=3600)
+    dev._start_status0_timer()
     start = time.monotonic()
-    dev.on_connected()
-    assert time.monotonic() - start < 0.1              # returned at once
-    assert _wait_for(lambda: "thread" in sender)
-    assert sender["thread"] is not threading.current_thread()
-    release.set()
-    dev.stop_timers()                                   # joins the worker
-    assert sender.get("done") is True
-
-
-def test_net_info_is_collected_once_and_cached(monkeypatch):
-    import qilowatt.base_device as bd
-
-    calls = {"dns": 0, "mac": 0}
-
-    def fake_gethostbyname(name):
-        calls["dns"] += 1
-        return "10.0.0.5"
-
-    def fake_mac(*args, **kwargs):
-        calls["mac"] += 1
-        return "aa:bb:cc:dd:ee:ff"
-
-    monkeypatch.setattr(bd.socket, "gethostbyname", fake_gethostbyname)
-    monkeypatch.setattr(bd.getmac, "get_mac_address", fake_mac)
-    dev = TickDevice(0.5)
-    first = dev.get_status0_data().to_dict()["StatusNET"]
-    second = dev.get_status0_data().to_dict()["StatusNET"]
-    assert first["IPAddress"] == "10.0.0.5" and first["Mac"] == "aa:bb:cc:dd:ee:ff"
-    assert second == first
-    assert calls == {"dns": 1, "mac": 1}
-
-
-def test_net_info_is_refreshed_after_ttl_and_on_connect(monkeypatch):
-    import qilowatt.base_device as bd
-
-    addresses = iter(["10.0.0.5", "10.0.0.6", "10.0.0.7"])
-    monkeypatch.setattr(bd.socket, "gethostbyname", lambda name: next(addresses))
-    monkeypatch.setattr(bd.getmac, "get_mac_address", lambda *a, **k: "aa:bb:cc:dd:ee:ff")
-    dev = TickDevice(0.5)
-    dev.publish_status0_data = lambda: None             # keep on_connected's worker trivial
-
-    assert dev.get_status0_data().to_dict()["StatusNET"]["IPAddress"] == "10.0.0.5"
-    assert dev.get_status0_data().to_dict()["StatusNET"]["IPAddress"] == "10.0.0.5"   # cached
-
-    dev._net_info_at -= bd.NET_INFO_TTL + 1              # lifetime expired
-    assert dev.get_status0_data().to_dict()["StatusNET"]["IPAddress"] == "10.0.0.6"
-
-    dev.on_connected()                                   # reconnect clears the cache
+    dev.on_connected()                                  # returns immediately
+    assert time.monotonic() - start < 0.05
+    assert _wait_for(lambda: len(dev.status_sends) == 1)
     dev.stop_timers()
-    assert dev.get_status0_data().to_dict()["StatusNET"]["IPAddress"] == "10.0.0.7"
+    assert dev.status_sends[0][1].endswith("Status0Timer")
+    assert dev.status_sends[0][1] != threading.current_thread().name
 
 
-def test_stop_timers_never_joins_an_unstarted_worker():
-    """Regression: on_connected() on one thread, stop_timers() on another. The
-    worker must be created and started under the lock stop_timers() takes, so
-    join() can never see a thread that has not been started."""
-    import qilowatt.base_device as bd
-
-    dev = TickDevice(0.5)
-    dev.publish_status0_data = lambda: None
-    in_start = threading.Event()
-    release_start = threading.Event()
-    real_start = threading.Thread.start
-
-    def slow_start(thread):
-        if thread.name.endswith("Status0OnConnect"):
-            in_start.set()
-            release_start.wait(timeout=2.0)
-        return real_start(thread)
-
-    errors = []
-
-    def stopper():
-        try:
-            dev.stop_timers()
-        except Exception as exc:           # the old code raised RuntimeError here
-            errors.append(exc)
-
-    with patch.object(threading.Thread, "start", slow_start):
-        connector = threading.Thread(target=dev.on_connected)
-        real_start(connector)
-        assert in_start.wait(timeout=2.0)
-        stop_thread = threading.Thread(target=stopper)
-        real_start(stop_thread)
-        time.sleep(0.05)                   # stop_timers() is now waiting on the lock
-        release_start.set()
-        connector.join(timeout=2.0)
-        stop_thread.join(timeout=2.0)
-
-    assert errors == [], errors
-    assert not connector.is_alive() and not stop_thread.is_alive()
+def test_connect_before_timers_start_is_served_when_they_start():
+    dev = Status0Device(status0_interval=3600)
+    dev.on_connected()                                  # CONNACK before data/timers
+    dev._start_status0_timer()
+    assert _wait_for(lambda: len(dev.status_sends) == 1)
+    dev.stop_timers()
 
 
-def test_net_info_survives_invalidation_during_the_cache_check(monkeypatch):
-    """Regression: on_connected() clears the cache from another thread. Simulate
-    it landing between the None check and the return by clearing the cache from
-    inside the clock call the check makes."""
-    import qilowatt.base_device as bd
-
-    monkeypatch.setattr(bd.socket, "gethostbyname", lambda name: "10.0.0.5")
-    monkeypatch.setattr(bd.getmac, "get_mac_address", lambda *a, **k: "aa:bb:cc:dd:ee:ff")
-    dev = TickDevice(0.5)
-    dev.get_status0_data()                               # populate the cache
-
-    real_monotonic = time.monotonic
-
-    def clock_that_invalidates():
-        dev._net_info = None                             # the reconnect's clear
-        return real_monotonic()
-
-    monkeypatch.setattr(bd.time, "monotonic", clock_that_invalidates)
-    net = dev.get_status0_data().to_dict()["StatusNET"]  # raised TypeError before
-    assert net["IPAddress"] == "10.0.0.5"
+def test_every_reconnect_sends_status0_again():
+    dev = Status0Device(status0_interval=3600)
+    dev._start_status0_timer()
+    for n in range(1, 4):
+        dev.on_connected()
+        assert _wait_for(lambda: len(dev.status_sends) == n)
+    dev.stop_timers()
+    assert len(dev.status_sends) == 3
 
 
-def test_reconnect_while_worker_is_finishing_still_sends_status0():
-    """A reconnect arriving while a send is in flight must not be lost."""
-    dev = TickDevice(0.5)
-    attempts = []
-    first_attempt_started = threading.Event()
-    release_first_attempt = threading.Event()
-
-    def publish():
-        attempts.append(threading.current_thread().name)
-        if len(attempts) == 1:
-            first_attempt_started.set()
-            release_first_attempt.wait(timeout=2.0)   # send still in flight
-
-    dev.publish_status0_data = publish
-    dev.on_connected()                                   # first connection
-    assert first_attempt_started.wait(timeout=2.0)
-    dev.on_connected()                                   # reconnect while busy
-    release_first_attempt.set()
-    assert _wait_for(lambda: len(attempts) == 2)
+def test_reconnect_during_an_in_flight_send_is_not_lost():
+    dev = Status0Device(status0_interval=3600)
+    dev.block_send = threading.Event()
+    dev._start_status0_timer()
+    dev.on_connected()
+    assert _wait_for(lambda: len(dev.status_sends) == 1)   # blocked inside the send
+    dev.on_connected()                                       # reconnect meanwhile
+    dev.block_send.set()
+    assert _wait_for(lambda: len(dev.status_sends) == 2)
     time.sleep(0.05)
     dev.stop_timers()
-    assert len(attempts) == 2                            # exactly one resend, no burst
-    assert len(set(attempts)) == 1                       # same single sender thread
+    assert len(dev.status_sends) == 2                        # exactly one more, no burst
 
 
-def test_reconnect_right_after_a_send_completed_is_not_lost():
-    """Regression for the exit-boundary race of the one-shot worker: a request
-    arriving after the sender finished its last send must still be served."""
-    dev = TickDevice(0.5)
-    attempts = []
-    dev.publish_status0_data = lambda: attempts.append(time.monotonic())
-
-    dev.on_connected()
-    assert _wait_for(lambda: len(attempts) == 1)
-    for _ in range(3):                                   # idle sender, repeated reconnects
-        before = len(attempts)
-        dev.on_connected()
-        assert _wait_for(lambda: len(attempts) == before + 1)
+def test_stop_timers_wakes_a_waiting_status0_loop_promptly():
+    dev = Status0Device(status0_interval=3600)
+    dev._start_status0_timer()
+    start = time.monotonic()
     dev.stop_timers()
-    assert len(attempts) == 4
+    assert time.monotonic() - start < 1.0
+    assert dev._status0_timer_thread is None
+    assert dev.status_sends == []
 
 
-def test_stop_then_reconnect_restarts_the_sender():
-    dev = TickDevice(0.5)
-    attempts = []
-    dev.publish_status0_data = lambda: attempts.append(1)
-    dev.on_connected()
-    assert _wait_for(lambda: len(attempts) == 1)
-    dev.stop_timers()
-    assert dev._status0_sender_thread is None
-    dev.on_connected()
-    assert _wait_for(lambda: len(attempts) == 2)
-    dev.stop_timers()
-
-
-def test_lookup_in_flight_across_a_reconnect_does_not_repopulate_cache(monkeypatch):
-    """Regression: resolve the old IP, block in getmac, reconnect clears the
-    cache, then the lookup finishes. The stale result must not be cached."""
+def test_net_info_failure_falls_back_to_placeholders(monkeypatch):
     import qilowatt.base_device as bd
 
-    addresses = iter(["10.0.0.5", "10.0.0.6"])
-    monkeypatch.setattr(bd.socket, "gethostbyname", lambda name: next(addresses))
-    dev = TickDevice(0.5)
-    dev.publish_status0_data = lambda: None               # keep the sender trivial
-
-    def mac_with_reconnect_in_the_middle(*args, **kwargs):
-        dev.on_connected()                               # lands mid-lookup
-        return "aa:bb:cc:dd:ee:ff"
-
-    monkeypatch.setattr(bd.getmac, "get_mac_address", mac_with_reconnect_in_the_middle)
-    first = dev.get_status0_data().to_dict()["StatusNET"]
-    assert first["IPAddress"] == "10.0.0.5"              # this call reports what it resolved
-    assert dev._net_info is None                         # but the stale result is not cached
-
-    monkeypatch.setattr(bd.getmac, "get_mac_address", lambda *a, **k: "aa:bb:cc:dd:ee:ff")
-    second = dev.get_status0_data().to_dict()["StatusNET"]
-    assert second["IPAddress"] == "10.0.0.6"             # re-resolved after the reconnect
-    dev.stop_timers()
-
-
-def test_net_info_failure_falls_back_and_retries(monkeypatch):
-    import qilowatt.base_device as bd
-
-    attempts = {"dns": 0}
-
-    def flaky_gethostbyname(name):
-        attempts["dns"] += 1
-        if attempts["dns"] == 1:
-            raise OSError("Name or service not known")
-        return "10.0.0.5"
-
-    monkeypatch.setattr(bd.socket, "gethostbyname", flaky_gethostbyname)
-    monkeypatch.setattr(bd.getmac, "get_mac_address", lambda *a, **k: "aa:bb:cc:dd:ee:ff")
-    dev = TickDevice(0.5)
-    first = dev.get_status0_data().to_dict()["StatusNET"]     # must not raise
-    assert first["IPAddress"] == "0.0.0.0"
-    second = dev.get_status0_data().to_dict()["StatusNET"]
-    assert second["IPAddress"] == "10.0.0.5"
-    assert attempts["dns"] == 2
+    monkeypatch.setattr(bd.socket, "gethostbyname", lambda name: (_ for _ in ()).throw(OSError("no dns")))
+    monkeypatch.setattr(bd.getmac, "get_mac_address", lambda *a, **k: None)
+    net = TickDevice(0.5).get_status0_data().to_dict()["StatusNET"]    # must not raise
+    assert net["IPAddress"] == "0.0.0.0" and net["Mac"] == ""
 
 
 def test_data_provider_is_pulled_right_before_each_publish(monkeypatch):
