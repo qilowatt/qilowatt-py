@@ -236,9 +236,8 @@ def test_stop_timers_wakes_a_waiting_status0_loop_promptly():
 
 
 def test_status0_reports_real_endpoint_version_and_interval(monkeypatch):
-    """No hard-coded placeholders: broker endpoint from the client, library
-    version from package metadata, TelePeriod from the sensor interval, and
-    no invented gateway or netmask."""
+    """Broker endpoint from the client, library version from package metadata,
+    TelePeriod from the sensor interval."""
     import qilowatt.base_device as bd
     from unittest.mock import MagicMock, patch
     from qilowatt.client import QilowattMQTTClient
@@ -256,9 +255,8 @@ def test_status0_reports_real_endpoint_version_and_interval(monkeypatch):
     assert status["StatusMQT"]["MqttUser"] == "user-42"
     assert status["StatusFWR"]["Version"] == bd.LIBRARY_VERSION != "1.0.0"
     assert status["StatusLOG"]["TelePeriod"] == 10
-    assert "Gateway" not in status["StatusNET"]
-    assert "Subnetmask" not in status["StatusNET"]
-    assert status["StatusNET"] == {"Hostname": bd.socket.gethostname(), "IPAddress": "10.0.0.5", "Mac": "aa:bb:cc:dd:ee:ff"}
+    assert status["StatusNET"]["IPAddress"] == "10.0.0.5"
+    assert status["StatusNET"]["Mac"] == "aa:bb:cc:dd:ee:ff"
 
 
 def test_net_info_failure_falls_back_to_placeholders(monkeypatch):

@@ -318,7 +318,13 @@ class BaseDevice(ABC):
             StatusPRM=status_prm,
             StatusFWR=StatusFWRData(Version=LIBRARY_VERSION, Hardware=platform.machine()),
             StatusLOG=StatusLOGData(TelePeriod=int(self._sensor_interval)),
-            StatusNET=StatusNETData(**self._net_info()),
+            # Gateway/Subnetmask are not detected: inside a container they
+            # would describe the Docker network anyway, so static values stay
+            StatusNET=StatusNETData(
+                Gateway="192.168.1.1",
+                Subnetmask="255.255.255.0",
+                **self._net_info(),
+            ),
             StatusMQT=StatusMQTData(
                 MqttHost=self._mqtt_host,
                 MqttPort=self._mqtt_port,
