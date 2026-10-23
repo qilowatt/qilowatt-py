@@ -11,6 +11,29 @@ from .base_device import BaseDevice
 
 _logger = logging.getLogger(__name__)
 
+# CONNACK codes meaning the credentials were rejected. MQTT 3.1.1 uses 4 (bad
+# user name or password) and 5 (not authorized); paho 2.x reports both through
+# a ReasonCode whose value follows the MQTT 5 table: 134 and 135.
+_AUTH_FAILURE_CODES = frozenset({4, 5, 134, 135})
+
+
+def _reason_value(reason_code) -> int:
+    """Return the numeric value of a paho ReasonCode or a plain int."""
+    value = getattr(reason_code, "value", reason_code)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _is_auth_failure(reason_code) -> bool:
+    return _reason_value(reason_code) in _AUTH_FAILURE_CODES
+
+
+def _is_success(reason_code) -> bool:
+    return _reason_value(reason_code) == 0
+
+
 class QilowattMQTTClient:
     """Client to handle MQTT communication with Qilowatt server."""
 
@@ -26,6 +49,15 @@ class QilowattMQTTClient:
         auth_retry_delay: float = 5.0,
         max_auth_retry_delay: float = 60.0,
     ):
+        """Create the client.
+
+        max_auth_retries: how many rejected CONNACKs (bad user name/password or
+            not authorized) to tolerate before giving up. Reconnection between
+            attempts is handled by paho's own loop, with the delay set by
+            reconnect_delay_set (10 s doubling to 60 s).
+        auth_retry_delay / max_auth_retry_delay: kept for backwards
+            compatibility; paho's reconnect delay now governs the retry pacing.
+        """
         self.mqtt_username = mqtt_username
         self.mqtt_password = mqtt_password
         self.device = device
@@ -43,8 +75,8 @@ class QilowattMQTTClient:
         self._subscribed = False
         self._lock = threading.Lock()
         self._connection_callbacks: List[Callable[[bool], None]] = []
+        self._error_callbacks: List[Callable[[Exception], None]] = []
         self._auth_failures = 0
-        self._retry_timer: Optional[threading.Timer] = None
         self._last_error: Optional[Exception] = None
         self._shutdown = False
 
@@ -114,6 +146,27 @@ class QilowattMQTTClient:
         if callback in self._connection_callbacks:
             self._connection_callbacks.remove(callback)
 
+    def add_error_callback(self, callback: Callable[[Exception], None]) -> None:
+        """Add a callback invoked when the client gives up on a connection.
+
+        Currently called with an AuthenticationError once the credentials have
+        been rejected more than max_auth_retries times. The client has already
+        stopped at that point; callers should surface the error to the user.
+        """
+        self._error_callbacks.append(callback)
+
+    def remove_error_callback(self, callback: Callable[[Exception], None]) -> None:
+        """Remove an error callback."""
+        if callback in self._error_callbacks:
+            self._error_callbacks.remove(callback)
+
+    def _notify_error(self, error: Exception):
+        for callback in self._error_callbacks:
+            try:
+                callback(error)
+            except Exception as e:
+                _logger.error(f"Error in error callback: {e}")
+
     def _notify_connection_change(self, connected: bool):
         """Notify all registered callbacks of connection state change."""
         for callback in self._connection_callbacks:
@@ -138,16 +191,15 @@ class QilowattMQTTClient:
 
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         _logger.debug(f"Connected with result code {reason_code}")
-        if reason_code == 0:
-            self._cancel_retry_timer()
+        if _is_success(reason_code):
             self._auth_failures = 0
             self._last_error = None
             self._subscribed = False
             self._subscribe_attempts = 0
             # Subscribe to command topic and wait for SUBACK
             self._attempt_subscribe()
-        elif reason_code == 5:
-            self._handle_authentication_failure()
+        elif _is_auth_failure(reason_code):
+            self._handle_authentication_failure(reason_code)
         else:
             error = ConnectionError(f"Connection failed with result code {reason_code}")
             self._last_error = error
@@ -261,7 +313,6 @@ class QilowattMQTTClient:
         """Disconnect from the MQTT broker and stop the loop."""
         with self._lock:
             self._shutdown = True
-            self._cancel_retry_timer()
             self._cancel_subscribe_timer()
             if self._connected or self._client.is_connected():
                 self._client.loop_stop()
@@ -275,81 +326,45 @@ class QilowattMQTTClient:
         """Return the most recent connection error, if any."""
         return self._last_error
 
-    def _handle_authentication_failure(self):
+    def _handle_authentication_failure(self, reason_code=None):
+        """Handle a CONNACK that rejected the credentials.
+
+        paho's network loop reconnects on its own after a refused CONNACK, so
+        this only counts the failures and stops the client once the limit is
+        exceeded. Stopping is final: callers must create a new connection
+        after fixing the credentials.
+        """
         self._connected = False
         self._notify_connection_change(False)
         self._auth_failures += 1
 
-        if self._auth_failures > self._max_auth_retries:
-            message = (
-                "Authentication failed after "
-                f"{self._max_auth_retries} retries"
-                if self._max_auth_retries
-                else "Authentication failed"
+        if self._auth_failures <= self._max_auth_retries:
+            _logger.warning(
+                "Authentication failed (%s, attempt %s/%s); paho will retry",
+                reason_code,
+                self._auth_failures,
+                self._max_auth_retries,
             )
-            error = AuthenticationError(message)
-            self._last_error = error
-            _logger.error(message)
-            with self._lock:
-                self._shutdown = True
-                self._cancel_retry_timer()
-                try:
-                    self._client.loop_stop()
-                except Exception:
-                    pass
-                try:
-                    self._client.disconnect()
-                except Exception:
-                    pass
-            self.device.stop_timers()
             return
 
-        delay = self._calculate_retry_delay(self._auth_failures)
-        _logger.warning(
-            "Authentication failed (attempt %s/%s). Retrying in %.1f seconds",
-            self._auth_failures,
-            self._max_auth_retries if self._max_auth_retries else "∞",
-            delay,
+        message = (
+            f"Authentication failed after {self._max_auth_retries} retries"
+            if self._max_auth_retries
+            else "Authentication failed"
         )
-        self._schedule_retry(delay)
-
-    def _calculate_retry_delay(self, attempt: int) -> float:
-        if attempt <= 0:
-            return self._auth_retry_delay
-        base_delay = self._auth_retry_delay or 0.0
-        delay = base_delay * (2 ** (attempt - 1)) if base_delay else 0.0
-        return min(delay if delay else base_delay, self._max_auth_retry_delay)
-
-    def _schedule_retry(self, delay: float):
+        error = AuthenticationError(message)
+        self._last_error = error
+        _logger.error(message)
         with self._lock:
-            if self._shutdown:
-                return
-            self._cancel_retry_timer()
-            self._retry_timer = threading.Timer(delay, self._attempt_reauth)
-            self._retry_timer.daemon = True
-            self._retry_timer.start()
-
-    def _cancel_retry_timer(self):
-        if self._retry_timer:
+            self._shutdown = True
+            self._cancel_subscribe_timer()
             try:
-                self._retry_timer.cancel()
+                self._client.loop_stop()
             except Exception:
                 pass
-            finally:
-                self._retry_timer = None
-
-    def _attempt_reauth(self):
-        with self._lock:
-            self._retry_timer = None
-            if self._shutdown or self._client.is_connected():
-                return
-
             try:
-                self._client.reconnect()
-            except Exception as exc:
-                _logger.error(f"Reconnect attempt failed: {exc}")
-                if self._auth_failures > self._max_auth_retries:
-                    self._last_error = AuthenticationError("Authentication failed")
-                    self._shutdown = True
-                    self._cancel_retry_timer()
-                    self.device.stop_timers()
+                self._client.disconnect()
+            except Exception:
+                pass
+        self.device.stop_timers()
+        self._notify_error(error)
