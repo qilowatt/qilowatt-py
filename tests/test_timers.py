@@ -177,7 +177,74 @@ def test_status0_timer_runs_on_the_grid_only():
     sent = []
     dev.publish_status0_data = lambda: sent.append(1)
     dev.on_connected()
-    assert sent == [1]
+    assert _wait_for(lambda: sent == [1])
+    dev.stop_timers()
+
+
+def test_on_connected_returns_immediately_and_sends_on_a_worker():
+    """Host discovery can block; the hook must not hold the MQTT thread."""
+    dev = TickDevice(0.5)
+    sender = {}
+    release = threading.Event()
+
+    def slow_publish():
+        sender["thread"] = threading.current_thread()
+        release.wait(timeout=2.0)
+        sender["done"] = True
+
+    dev.publish_status0_data = slow_publish
+    start = time.monotonic()
+    dev.on_connected()
+    assert time.monotonic() - start < 0.1              # returned at once
+    assert _wait_for(lambda: "thread" in sender)
+    assert sender["thread"] is not threading.current_thread()
+    release.set()
+    dev.stop_timers()                                   # joins the worker
+    assert sender.get("done") is True
+
+
+def test_net_info_is_collected_once_and_cached(monkeypatch):
+    import qilowatt.base_device as bd
+
+    calls = {"dns": 0, "mac": 0}
+
+    def fake_gethostbyname(name):
+        calls["dns"] += 1
+        return "10.0.0.5"
+
+    def fake_mac(*args, **kwargs):
+        calls["mac"] += 1
+        return "aa:bb:cc:dd:ee:ff"
+
+    monkeypatch.setattr(bd.socket, "gethostbyname", fake_gethostbyname)
+    monkeypatch.setattr(bd.getmac, "get_mac_address", fake_mac)
+    dev = TickDevice(0.5)
+    first = dev.get_status0_data().to_dict()["StatusNET"]
+    second = dev.get_status0_data().to_dict()["StatusNET"]
+    assert first["IPAddress"] == "10.0.0.5" and first["Mac"] == "aa:bb:cc:dd:ee:ff"
+    assert second == first
+    assert calls == {"dns": 1, "mac": 1}
+
+
+def test_net_info_failure_falls_back_and_retries(monkeypatch):
+    import qilowatt.base_device as bd
+
+    attempts = {"dns": 0}
+
+    def flaky_gethostbyname(name):
+        attempts["dns"] += 1
+        if attempts["dns"] == 1:
+            raise OSError("Name or service not known")
+        return "10.0.0.5"
+
+    monkeypatch.setattr(bd.socket, "gethostbyname", flaky_gethostbyname)
+    monkeypatch.setattr(bd.getmac, "get_mac_address", lambda *a, **k: "aa:bb:cc:dd:ee:ff")
+    dev = TickDevice(0.5)
+    first = dev.get_status0_data().to_dict()["StatusNET"]     # must not raise
+    assert first["IPAddress"] == "0.0.0.0"
+    second = dev.get_status0_data().to_dict()["StatusNET"]
+    assert second["IPAddress"] == "10.0.0.5"
+    assert attempts["dns"] == 2
 
 
 def test_data_provider_is_pulled_right_before_each_publish(monkeypatch):

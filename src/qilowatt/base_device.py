@@ -58,6 +58,10 @@ class BaseDevice(ABC):
         self._sensor_timer_stop_event = threading.Event()
         self._state_timer_stop_event = threading.Event()
         self._status0_timer_stop_event = threading.Event()
+
+        # Worker for the on-connect STATUS0 send, and cached host information
+        self._status0_connect_thread: Optional[threading.Thread] = None
+        self._net_info: Optional[Dict[str, str]] = None
         
         self._startup_utc = datetime.utcnow()
         self._boot_count = 1
@@ -141,6 +145,11 @@ class BaseDevice(ABC):
                       self._status0_timer_thread]:
             if thread:
                 thread.join()
+        worker = self._status0_connect_thread
+        if worker is not None and worker is not threading.current_thread():
+            # Bounded: it may be inside a slow host lookup; daemon anyway
+            worker.join(timeout=5.0)
+        self._status0_connect_thread = None
                 
         # Reset events and threads
         self._sensor_timer_stop_event.clear()
@@ -229,12 +238,61 @@ class BaseDevice(ABC):
     def on_connected(self):
         """Called by the client once it is connected and subscribed.
 
-        Sends STATUS0 right away so the backend gets the device information
-        (StartupUTC, BootCount, network) at every connect and reconnect. The
-        hourly timer below must not do this itself: timers may start before
-        the CONNACK has arrived, and a message sent then is dropped.
+        Sends STATUS0 so the backend gets the device information (StartupUTC,
+        BootCount, network) at every connect and reconnect. The hourly timer
+        must not do this itself: timers may start before the CONNACK has
+        arrived, and a message sent then is dropped.
+
+        Runs on paho's network thread (or a timer thread), so the actual send
+        is handed to a short-lived worker: collecting host information can
+        block on DNS or on getmac shelling out, and that must not stall MQTT
+        processing or keepalives. Returns immediately.
         """
-        self.publish_status0_data()
+        previous = self._status0_connect_thread
+        if previous is not None and previous.is_alive():
+            # A send from the previous connection is still in flight; it will
+            # either go out on this connection or be dropped as not connected.
+            return
+
+        def _send():
+            try:
+                self.publish_status0_data()
+            except Exception:
+                _logger.exception("STATUS0 on connect failed")
+
+        self._status0_connect_thread = threading.Thread(
+            target=_send, name=f"{self.__class__.__name__}Status0OnConnect", daemon=True
+        )
+        self._status0_connect_thread.start()
+
+    def _get_net_info(self) -> Dict[str, str]:
+        """Hostname, IP and MAC, collected once and cached.
+
+        The lookups can block (DNS, getmac subprocesses) and the values do not
+        change while the process runs. Failures fall back to placeholders and
+        are retried on the next call.
+        """
+        if self._net_info is not None:
+            return self._net_info
+        hostname = socket.gethostname()
+        try:
+            ip_address = socket.gethostbyname(hostname)
+        except OSError as exc:
+            _logger.debug("Could not resolve %s: %s", hostname, exc)
+            ip_address = None
+        try:
+            mac = getmac.get_mac_address()
+        except Exception as exc:  # getmac can fail in odd ways on some hosts
+            _logger.debug("Could not determine MAC address: %s", exc)
+            mac = None
+        info = {
+            "Hostname": hostname,
+            "IPAddress": ip_address or "0.0.0.0",
+            "Mac": mac or "",
+        }
+        if ip_address is not None and mac:
+            self._net_info = info
+        return info
 
     def _start_status0_timer(self):
         """Start timer for sending status data hourly (the first one is sent
@@ -268,11 +326,9 @@ class BaseDevice(ABC):
             StatusFWR=StatusFWRData(Version="1.0.0", Hardware=platform.machine()),
             StatusLOG=StatusLOGData(TelePeriod=10),
             StatusNET=StatusNETData(
-                Hostname=socket.gethostname(),
-                IPAddress=socket.gethostbyname(socket.gethostname()),
                 Gateway="192.168.1.1",
                 Subnetmask="255.255.255.0",
-                Mac=getmac.get_mac_address()
+                **self._get_net_info(),
             ),
             StatusMQT=StatusMQTData(
                 MqttHost="mqtt-test.qilowatt.it",
