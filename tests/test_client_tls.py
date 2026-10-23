@@ -63,17 +63,18 @@ def self_signed_tls_server(tmp_path):
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
-    yield listener.getsockname()[1], seen
+    yield listener.getsockname()[1], seen, thread
     listener.close()
     thread.join(timeout=5)
 
 
 def test_untrusted_broker_certificate_is_rejected_before_credentials_are_sent(self_signed_tls_server):
-    port, seen = self_signed_tls_server
+    port, seen, server = self_signed_tls_server
     client = QilowattMQTTClient(
         mqtt_username="u", mqtt_password="p", device=DummyDevice(), host="localhost", port=port
     )
     with pytest.raises(ssl.SSLCertVerificationError):
         client.connect()
     client.disconnect()
-    assert seen["handshake_failed"]   # the server never got past the handshake
+    server.join(timeout=5)            # let the server record how the connection ended
+    assert seen["handshake_failed"]   # it never got past the handshake
