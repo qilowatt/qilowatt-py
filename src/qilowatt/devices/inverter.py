@@ -5,7 +5,7 @@ from ..models import (
 import json
 import logging
 from datetime import datetime
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any, Callable, Tuple
 
 _logger = logging.getLogger(__name__)
 
@@ -15,12 +15,13 @@ ABSOLUTE_MAX_POWER = 100000.0
 class InverterDevice(BaseDevice):
     """Implementation of an inverter device."""
     
-    def __init__(self, device_id: str):
-        super().__init__(device_id)
+    def __init__(self, device_id: str, **timer_intervals):
+        super().__init__(device_id, **timer_intervals)
         self._energy_data: Optional[EnergyData] = None
         self._metrics_data: Optional[MetricsData] = None
         self._workmode_command = WorkModeCommand.from_dict({"Mode": "normal"})
         self._on_command_callback: Optional[Callable[[WorkModeCommand], None]] = None
+        self._data_provider: Optional[Callable[[], Tuple[EnergyData, MetricsData]]] = None
         
         # Max value limits - values exceeding these will be reported as 0
         self._max_energy_power: Optional[float] = None
@@ -40,6 +41,40 @@ class InverterDevice(BaseDevice):
         if self._energy_data and self._metrics_data and not self._data_initialized:
             self._data_initialized = True
             self.start_timers()
+
+    def set_data_provider(
+        self, provider: Optional[Callable[[], Tuple[EnergyData, MetricsData]]]
+    ):
+        """Pull ENERGY and METRICS from `provider` right before each SENSOR publish.
+
+        This keeps the publish cadence on the device's own fixed 10 s grid while
+        making every payload carry data read milliseconds before it is sent.
+        Callers using a provider do not need set_energy_data / set_metrics_data.
+
+        The provider is called on the sensor timer thread and must return an
+        (EnergyData, MetricsData) tuple. If it raises, the error is logged and
+        the last successfully read data is published instead; if there is no
+        such data yet, that slot is skipped. Setting a provider starts the
+        publishing timers; pass None to stop pulling (the last data is kept).
+        """
+        self._data_provider = provider
+        if provider is not None and not self._data_initialized:
+            self._data_initialized = True
+            self.start_timers()
+
+    def _refresh_from_provider(self):
+        if self._data_provider is None:
+            return
+        try:
+            energy_data, metrics_data = self._data_provider()
+        except Exception:
+            _logger.exception("Data provider failed; publishing last known data")
+            return
+        if energy_data is None or metrics_data is None:
+            _logger.warning("Data provider returned no data; publishing last known data")
+            return
+        self._energy_data = energy_data
+        self._metrics_data = metrics_data
             
     def handle_command(self, payload: bytes):
         """Handle WORKMODE commands."""
@@ -88,7 +123,8 @@ class InverterDevice(BaseDevice):
 
     def get_sensor_data(self) -> Dict[str, Any]:
         """Get current sensor data."""
-        if not self._data_initialized:
+        self._refresh_from_provider()
+        if not self._data_initialized or self._energy_data is None or self._metrics_data is None:
             return {}
         
         # Apply power limits to energy data
