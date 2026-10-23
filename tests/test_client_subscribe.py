@@ -524,3 +524,46 @@ def test_listener_may_call_disconnect_from_the_callback(patched_environment):
 
     assert states == [True, False]
     assert client.connected is False and client._shutdown is True
+
+
+def test_listener_disconnect_on_subscribe_timeout_path_does_not_deadlock(patched_environment):
+    """Regression: on the subscribe-gave-up path the connected notification is
+    delivered on a timer thread. A listener that calls disconnect() makes
+    loop_stop() join the network thread; if that thread is entering
+    _on_disconnect() it needs the state lock, which must not be held across
+    the listener call."""
+    import threading
+
+    mock_client = patched_environment
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    states = []
+    joined = {}
+
+    def listener(connected):
+        states.append(connected)
+        if connected:
+            client.disconnect()
+
+    def loop_stop_joins_network_thread(*args, **kwargs):
+        if "done" in joined:
+            return mqtt.MQTT_ERR_SUCCESS
+        network = threading.Thread(
+            target=client._on_disconnect, args=(mock_client, None, MagicMock(), 7, None)
+        )
+        network.start()
+        network.join(timeout=2.0)
+        joined["done"] = not network.is_alive()
+        return mqtt.MQTT_ERR_SUCCESS
+
+    client.add_connection_callback(listener)
+    mock_client.loop_stop.side_effect = loop_stop_joins_network_thread
+
+    client.connect()
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+    for _ in range(client._max_subscribe_retries):
+        fire_pending_timers()                     # SUBACK never arrives -> connected anyway
+
+    assert joined.get("done") is True, "network thread blocked on the state lock while loop_stop() joined it"
+    assert states == [True, False]
+    assert client.connected is False and client._shutdown is True
