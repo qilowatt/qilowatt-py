@@ -70,7 +70,8 @@ def test_rejected_credentials_are_counted_but_not_fatal_before_limit(mock_client
     client.connect()
     connack(client, mock_client, reason_code)
 
-    assert states == [False]
+    # Never connected, so no "disconnected" notification either
+    assert states == []
     assert client.last_error() is None
     assert errors == []
     assert client._shutdown is False
@@ -185,10 +186,15 @@ def test_connection_callback_that_unregisters_itself_does_not_skip_the_next(mock
     def second(connected):
         received.append(("second", connected))
 
+    # Bring the client up first so that a drop is a real state change
+    client.connect()
+    mock_client.is_connected.return_value = True
+    connack(client, mock_client, SUCCESS)
+    client._on_subscribe(mock_client, None, 1, [0], None)
+    assert client.connected is True
+
     client.add_connection_callback(first)
     client.add_connection_callback(second)
-
-    client.connect()
-    connack(client, mock_client, BAD_CREDENTIALS)
+    client._on_disconnect(mock_client, None, MagicMock(), 7, None)
 
     assert received == [("first", False), ("second", False)]
