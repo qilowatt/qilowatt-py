@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, Callable
+import math
 import threading
 import logging
 import time
@@ -19,6 +20,21 @@ SENSOR_INTERVAL = 10.0   # seconds; the Qilowatt backend expects SENSOR exactly 
 STATE_INTERVAL = 60.0
 STATUS0_INTERVAL = 3600.0
 
+# After a publish, the next grid slot must be at least this fraction of an
+# interval after the publish *finished*. Normal publishes take milliseconds, so
+# this never triggers in steady state and the schedule stays exactly on the
+# grid; it only skips slots after a disruption (a stalled publish, a suspended
+# host), so two messages are never sent close together.
+MIN_SPACING_FRACTION = 0.9
+
+
+def _check_interval(name: str, value: float) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise TypeError(f"{name} must be a number of seconds, got {value!r}")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number of seconds, got {value!r}")
+    return float(value)
+
 
 class BaseDevice(ABC):
     """Base class for all devices that can communicate via MQTT."""
@@ -31,9 +47,9 @@ class BaseDevice(ABC):
         status0_interval: float = STATUS0_INTERVAL,
     ):
         self.device_id = device_id
-        self._sensor_interval = sensor_interval
-        self._state_interval = state_interval
-        self._status0_interval = status0_interval
+        self._sensor_interval = _check_interval("sensor_interval", sensor_interval)
+        self._state_interval = _check_interval("state_interval", state_interval)
+        self._status0_interval = _check_interval("status0_interval", status0_interval)
         self._data_initialized = False
         self._sensor_timer_thread: Optional[threading.Thread] = None
         self._state_timer_thread: Optional[threading.Thread] = None
@@ -154,10 +170,12 @@ class BaseDevice(ABC):
 
         The schedule is anchored to a monotonic clock, so the time spent inside
         action (reading data, serialising, publishing) does not accumulate into
-        drift: the n-th run is due at start + n * interval. If a run is late by
-        more than one interval (a stalled publish, a suspended host), the missed
-        slots are skipped rather than published in a burst. An exception in
-        action is logged and does not stop the timer.
+        drift: the n-th run is due at start + n * interval. After each run the
+        next slot is chosen so that it lies at least MIN_SPACING_FRACTION of an
+        interval after the run *finished*: a stalled publish or a late wake-up
+        (suspended host) therefore skips the missed slots instead of being
+        followed by another message a few seconds later. An exception in action
+        is logged and does not stop the timer.
         """
         def _safe_action():
             try:
@@ -165,6 +183,7 @@ class BaseDevice(ABC):
             except Exception:
                 _logger.exception("Periodic publish failed; will retry on the next slot")
 
+        min_spacing = interval * MIN_SPACING_FRACTION
         if run_immediately:
             _safe_action()
         next_at = time.monotonic() + interval
@@ -172,9 +191,9 @@ class BaseDevice(ABC):
             if stop_event.wait(max(0.0, next_at - time.monotonic())):
                 return
             _safe_action()
+            finished = time.monotonic()
             next_at += interval
-            now = time.monotonic()
-            while next_at <= now:
+            while next_at < finished + min_spacing:
                 next_at += interval
 
     def _start_sensor_timer(self):
