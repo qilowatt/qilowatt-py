@@ -226,12 +226,22 @@ class BaseDevice(ABC):
         if hasattr(self, '_publish_callback'):
             self._publish_callback(self.status0_topic, status0_data.to_dict())
 
+    def on_connected(self):
+        """Called by the client once it is connected and subscribed.
+
+        Sends STATUS0 right away so the backend gets the device information
+        (StartupUTC, BootCount, network) at every connect and reconnect. The
+        hourly timer below must not do this itself: timers may start before
+        the CONNACK has arrived, and a message sent then is dropped.
+        """
+        self.publish_status0_data()
+
     def _start_status0_timer(self):
-        """Start timer for sending status data: at startup, then hourly."""
+        """Start timer for sending status data hourly (the first one is sent
+        from on_connected, not here)."""
         self._status0_timer_thread = threading.Thread(
             target=self._run_on_grid,
             args=(self._status0_timer_stop_event, self._status0_interval, self.publish_status0_data),
-            kwargs={"run_immediately": True},
             name=f"{self.__class__.__name__}Status0Timer",
         )
         self._status0_timer_thread.daemon = True

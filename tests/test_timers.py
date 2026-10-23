@@ -154,7 +154,9 @@ def test_non_numeric_interval_is_rejected():
         InverterDevice("DEV", sensor_interval="10")
 
 
-def test_status0_is_sent_at_startup_then_on_the_grid():
+def test_status0_timer_runs_on_the_grid_only():
+    """The startup STATUS0 is sent from on_connected(); the timer must not send
+    one immediately, since timers can start before the CONNACK has arrived."""
     class StatusDevice(TickDevice):
         def __init__(self):
             super().__init__(0.5)
@@ -166,10 +168,16 @@ def test_status0_is_sent_at_startup_then_on_the_grid():
     dev = StatusDevice()
     start = time.monotonic()
     dev._start_status0_timer()
-    assert _wait_for(lambda: len(dev.status_ticks) >= 3)
+    time.sleep(0.02)
+    assert dev.status_ticks == []                       # nothing immediately
+    assert _wait_for(lambda: len(dev.status_ticks) >= 2)
     dev.stop_timers()
-    assert dev.status_ticks[0] - start < 0.03          # immediately at startup
-    assert dev.status_ticks[1] - start > 0.04          # then after one interval
+    assert dev.status_ticks[0] - start > 0.04           # first one after an interval
+
+    sent = []
+    dev.publish_status0_data = lambda: sent.append(1)
+    dev.on_connected()
+    assert sent == [1]
 
 
 def test_data_provider_is_pulled_right_before_each_publish(monkeypatch):

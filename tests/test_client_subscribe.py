@@ -17,6 +17,11 @@ class DummyDevice(BaseDevice):
     def __init__(self):
         super().__init__(device_id="DEVICE123")
         self.stop_called = False
+        self.status0_sent = 0
+
+    def publish_status0_data(self):
+        # The real one collects host/network info; just count the sends
+        self.status0_sent += 1
 
     def handle_command(self, payload: bytes) -> None:
         pass
@@ -367,3 +372,73 @@ def test_disconnect_does_not_hold_lock_while_joining_network_thread(patched_envi
 
     assert joined["ok"], "network thread blocked on client._lock while loop_stop() joined it"
     assert client._shutdown is True
+
+
+def test_status0_is_sent_once_connected_not_before(patched_environment):
+    """STATUS0 goes out from the connected path, after SUBACK, so it is never
+    attempted (and dropped) before the CONNACK has arrived."""
+    mock_client = patched_environment
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    order = []
+    client.add_connection_callback(lambda c: order.append(("listener", c)))
+    device.publish_status0_data = lambda: order.append(("status0", None))
+
+    client.connect()
+    assert order == []                                   # TCP up, no CONNACK yet
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+    assert order == []                                   # CONNACK, waiting for SUBACK
+    client._on_subscribe(mock_client, None, 1, [0], None)
+    assert order == [("status0", None), ("listener", True)]
+
+    client.disconnect()
+
+
+def test_status0_is_resent_on_every_reconnect(patched_environment):
+    mock_client = patched_environment
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+
+    client.connect()
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+    client._on_subscribe(mock_client, None, 1, [0], None)
+    assert device.status0_sent == 1
+
+    client._on_disconnect(mock_client, None, MagicMock(), 7, None)   # broker drop
+    client._on_connect(mock_client, None, MagicMock(), 0, None)      # paho reconnected
+    client._on_subscribe(mock_client, None, 1, [0], None)
+    assert device.status0_sent == 2
+
+    # A duplicate SUBACK on the same connection does not resend
+    client._on_subscribe(mock_client, None, 1, [0], None)
+    assert device.status0_sent == 2
+    client.disconnect()
+
+
+def test_status0_is_sent_when_subscribe_gives_up(patched_environment):
+    """The client marks itself connected even if subscribing fails for good;
+    STATUS0 must go out on that path too."""
+    mock_client = patched_environment
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    client.connect()
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+    for _ in range(client._max_subscribe_retries):
+        fire_pending_timers()                             # SUBACK never arrives
+    assert client.connected is True
+    assert device.status0_sent == 1
+    client.disconnect()
+
+
+def test_failing_on_connected_hook_does_not_block_connection(patched_environment):
+    mock_client = patched_environment
+    device = DummyDevice()
+    device.publish_status0_data = lambda: (_ for _ in ()).throw(RuntimeError("no network info"))
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    states = []
+    client.add_connection_callback(states.append)
+    client.connect()
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+    client._on_subscribe(mock_client, None, 1, [0], None)
+    assert client.connected is True and states == [True]
+    client.disconnect()

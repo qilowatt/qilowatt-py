@@ -23,6 +23,11 @@ class DummyDevice(BaseDevice):
     def __init__(self):
         super().__init__(device_id="DEVICE123")
         self.stop_called = False
+        self.status0_sent = 0
+
+    def publish_status0_data(self):
+        # The real one collects host/network info; just count the sends
+        self.status0_sent += 1
 
     def handle_command(self, payload: bytes) -> None:  # pragma: no cover - not used in tests
         pass

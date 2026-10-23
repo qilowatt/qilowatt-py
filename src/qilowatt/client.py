@@ -215,6 +215,19 @@ class QilowattMQTTClient:
         self._pending_subscribe_mid = None
         self._set_disconnected()
 
+    def _set_connected(self):
+        """Mark the client connected (once per connection) and let the device
+        send what the backend expects at every (re)connect, before listeners
+        are notified. Runs on paho's network thread."""
+        if self._connected:
+            return
+        self._connected = True
+        try:
+            self.device.on_connected()
+        except Exception:
+            _logger.exception("Error in device on_connected hook")
+        self._notify_connection_change(True)
+
     def _set_disconnected(self) -> bool:
         """Mark the client disconnected; notify listeners only on an actual change.
 
@@ -271,9 +284,7 @@ class QilowattMQTTClient:
             self._subscribe_attempts = 0
 
             # Now we're fully connected and subscribed
-            if not self._connected:
-                self._connected = True
-                self._notify_connection_change(True)
+            self._set_connected()
 
     def _on_subscribe_timeout(self):
         """Called when subscription confirmation times out."""
@@ -297,9 +308,7 @@ class QilowattMQTTClient:
             )
             # Still mark as connected so publishing works, but log the issue
             # The client can still publish, just won't receive commands
-            if not self._connected:
-                self._connected = True
-                self._notify_connection_change(True)
+            self._set_connected()
 
     def _cancel_subscribe_timer(self):
         """Cancel the subscription timeout timer."""
