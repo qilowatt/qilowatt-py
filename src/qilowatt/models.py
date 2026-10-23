@@ -152,9 +152,11 @@ class StatusLOGData:
 class StatusNETData:
     Hostname: str
     IPAddress: str
-    Gateway: str
-    Subnetmask: str
     Mac: str
+    # Not detected by this library; left out of the payload when None rather
+    # than filled with placeholders
+    Gateway: Optional[str] = None
+    Subnetmask: Optional[str] = None
     DNSServer1: Optional[str] = None
     DNSServer2: Optional[str] = None
 
@@ -186,12 +188,15 @@ class Status0Data:
     StatusTIM: StatusTIMData
 
     def to_dict(self) -> dict:
+        def known(section) -> dict:
+            return {k: v for k, v in section.__dict__.items() if v is not None}
+
         return {
-            "Status": self.Status.__dict__,
-            "StatusPRM": self.StatusPRM.__dict__,
-            "StatusFWR": self.StatusFWR.__dict__,
-            "StatusLOG": self.StatusLOG.__dict__,
-            "StatusNET": self.StatusNET.__dict__,
-            "StatusMQT": self.StatusMQT.__dict__,
-            "StatusTIM": self.StatusTIM.__dict__,
+            "Status": known(self.Status),
+            "StatusPRM": known(self.StatusPRM),
+            "StatusFWR": known(self.StatusFWR),
+            "StatusLOG": known(self.StatusLOG),
+            "StatusNET": known(self.StatusNET),
+            "StatusMQT": known(self.StatusMQT),
+            "StatusTIM": known(self.StatusTIM),
         }

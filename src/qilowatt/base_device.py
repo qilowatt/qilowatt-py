@@ -13,6 +13,12 @@ from .models import (
 import platform
 import socket
 import getmac
+from importlib.metadata import PackageNotFoundError, version as _package_version
+
+try:
+    LIBRARY_VERSION = _package_version("qilowatt")
+except PackageNotFoundError:  # running from a checkout that is not installed
+    LIBRARY_VERSION = "unknown"
 
 _logger = logging.getLogger(__name__)
 
@@ -61,6 +67,11 @@ class BaseDevice(ABC):
 
         # Set by on_connected(); the STATUS0 timer thread wakes on it and sends
         self._status0_request = threading.Event()
+
+        # Broker endpoint, reported in STATUS0; set by the client that owns us
+        self._mqtt_host = ""
+        self._mqtt_port = 0
+        self._mqtt_user = ""
         
         self._startup_utc = datetime.utcnow()
         self._boot_count = 1
@@ -305,18 +316,14 @@ class BaseDevice(ABC):
         return Status0Data(
             Status=status,
             StatusPRM=status_prm,
-            StatusFWR=StatusFWRData(Version="1.0.0", Hardware=platform.machine()),
-            StatusLOG=StatusLOGData(TelePeriod=10),
-            StatusNET=StatusNETData(
-                Gateway="192.168.1.1",
-                Subnetmask="255.255.255.0",
-                **self._net_info(),
-            ),
+            StatusFWR=StatusFWRData(Version=LIBRARY_VERSION, Hardware=platform.machine()),
+            StatusLOG=StatusLOGData(TelePeriod=int(self._sensor_interval)),
+            StatusNET=StatusNETData(**self._net_info()),
             StatusMQT=StatusMQTData(
-                MqttHost="mqtt-test.qilowatt.it",
-                MqttPort=8883,
+                MqttHost=self._mqtt_host,
+                MqttPort=self._mqtt_port,
                 MqttClient="",
-                MqttUser="",
+                MqttUser=self._mqtt_user,
                 MqttClientMask="QWAPI_%06X"
             ),
             StatusTIM=StatusTIMData(
@@ -324,6 +331,12 @@ class BaseDevice(ABC):
                 Local=datetime.now().isoformat()
             )
         )
+
+    def set_mqtt_info(self, host: str, port: int, username: str = ""):
+        """Record the broker endpoint this device publishes through, for STATUS0."""
+        self._mqtt_host = host
+        self._mqtt_port = port
+        self._mqtt_user = username
 
     def set_publish_callback(self, callback: Callable[[str, Dict[str, Any]], None]):
         """Set callback for publishing data."""

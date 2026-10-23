@@ -116,6 +116,7 @@ class QilowattMQTTClient:
                 self._set_disconnected()
         
         self.device.set_publish_callback(publish_callback)
+        self.device.set_mqtt_info(self.host, self.port, self.mqtt_username)
 
     @property
     def connected(self) -> bool:

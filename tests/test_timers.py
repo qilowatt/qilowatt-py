@@ -235,6 +235,32 @@ def test_stop_timers_wakes_a_waiting_status0_loop_promptly():
     assert dev.status_sends == []
 
 
+def test_status0_reports_real_endpoint_version_and_interval(monkeypatch):
+    """No hard-coded placeholders: broker endpoint from the client, library
+    version from package metadata, TelePeriod from the sensor interval, and
+    no invented gateway or netmask."""
+    import qilowatt.base_device as bd
+    from unittest.mock import MagicMock, patch
+    from qilowatt.client import QilowattMQTTClient
+
+    monkeypatch.setattr(bd.socket, "gethostbyname", lambda name: "10.0.0.5")
+    monkeypatch.setattr(bd.getmac, "get_mac_address", lambda *a, **k: "aa:bb:cc:dd:ee:ff")
+    dev = TickDevice(0.5)
+    dev._sensor_interval = 10.0
+    with patch("qilowatt.client.mqtt.Client", return_value=MagicMock()):
+        QilowattMQTTClient("user-42", "pw", dev, host="broker.example", port=1883)
+
+    status = dev.get_status0_data().to_dict()
+    assert status["StatusMQT"]["MqttHost"] == "broker.example"
+    assert status["StatusMQT"]["MqttPort"] == 1883
+    assert status["StatusMQT"]["MqttUser"] == "user-42"
+    assert status["StatusFWR"]["Version"] == bd.LIBRARY_VERSION != "1.0.0"
+    assert status["StatusLOG"]["TelePeriod"] == 10
+    assert "Gateway" not in status["StatusNET"]
+    assert "Subnetmask" not in status["StatusNET"]
+    assert status["StatusNET"] == {"Hostname": bd.socket.gethostname(), "IPAddress": "10.0.0.5", "Mac": "aa:bb:cc:dd:ee:ff"}
+
+
 def test_net_info_failure_falls_back_to_placeholders(monkeypatch):
     import qilowatt.base_device as bd
 
