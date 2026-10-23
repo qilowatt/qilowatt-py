@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -224,6 +225,67 @@ def test_net_info_is_collected_once_and_cached(monkeypatch):
     assert first["IPAddress"] == "10.0.0.5" and first["Mac"] == "aa:bb:cc:dd:ee:ff"
     assert second == first
     assert calls == {"dns": 1, "mac": 1}
+
+
+def test_net_info_is_refreshed_after_ttl_and_on_connect(monkeypatch):
+    import qilowatt.base_device as bd
+
+    addresses = iter(["10.0.0.5", "10.0.0.6", "10.0.0.7"])
+    monkeypatch.setattr(bd.socket, "gethostbyname", lambda name: next(addresses))
+    monkeypatch.setattr(bd.getmac, "get_mac_address", lambda *a, **k: "aa:bb:cc:dd:ee:ff")
+    dev = TickDevice(0.5)
+    dev.publish_status0_data = lambda: None             # keep on_connected's worker trivial
+
+    assert dev.get_status0_data().to_dict()["StatusNET"]["IPAddress"] == "10.0.0.5"
+    assert dev.get_status0_data().to_dict()["StatusNET"]["IPAddress"] == "10.0.0.5"   # cached
+
+    dev._net_info_at -= bd.NET_INFO_TTL + 1              # lifetime expired
+    assert dev.get_status0_data().to_dict()["StatusNET"]["IPAddress"] == "10.0.0.6"
+
+    dev.on_connected()                                   # reconnect clears the cache
+    dev.stop_timers()
+    assert dev.get_status0_data().to_dict()["StatusNET"]["IPAddress"] == "10.0.0.7"
+
+
+def test_stop_timers_never_joins_an_unstarted_worker():
+    """Regression: on_connected() on one thread, stop_timers() on another. The
+    worker must be created and started under the lock stop_timers() takes, so
+    join() can never see a thread that has not been started."""
+    import qilowatt.base_device as bd
+
+    dev = TickDevice(0.5)
+    dev.publish_status0_data = lambda: None
+    in_start = threading.Event()
+    release_start = threading.Event()
+    real_start = threading.Thread.start
+
+    def slow_start(thread):
+        if thread.name.endswith("Status0OnConnect"):
+            in_start.set()
+            release_start.wait(timeout=2.0)
+        return real_start(thread)
+
+    errors = []
+
+    def stopper():
+        try:
+            dev.stop_timers()
+        except Exception as exc:           # the old code raised RuntimeError here
+            errors.append(exc)
+
+    with patch.object(threading.Thread, "start", slow_start):
+        connector = threading.Thread(target=dev.on_connected)
+        real_start(connector)
+        assert in_start.wait(timeout=2.0)
+        stop_thread = threading.Thread(target=stopper)
+        real_start(stop_thread)
+        time.sleep(0.05)                   # stop_timers() is now waiting on the lock
+        release_start.set()
+        connector.join(timeout=2.0)
+        stop_thread.join(timeout=2.0)
+
+    assert errors == [], errors
+    assert not connector.is_alive() and not stop_thread.is_alive()
 
 
 def test_net_info_failure_falls_back_and_retries(monkeypatch):

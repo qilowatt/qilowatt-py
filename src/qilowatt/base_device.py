@@ -27,6 +27,10 @@ STATUS0_INTERVAL = 3600.0
 # host), so two messages are never sent close together.
 MIN_SPACING_FRACTION = 0.9
 
+# Cached host information (hostname, IP, MAC) is re-resolved after this long,
+# and on every (re)connect, so an address change is reported within an hour.
+NET_INFO_TTL = 3600.0
+
 
 def _check_interval(name: str, value: float) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
@@ -61,7 +65,9 @@ class BaseDevice(ABC):
 
         # Worker for the on-connect STATUS0 send, and cached host information
         self._status0_connect_thread: Optional[threading.Thread] = None
+        self._status0_worker_lock = threading.Lock()
         self._net_info: Optional[Dict[str, str]] = None
+        self._net_info_at: float = 0.0
         
         self._startup_utc = datetime.utcnow()
         self._boot_count = 1
@@ -145,11 +151,14 @@ class BaseDevice(ABC):
                       self._status0_timer_thread]:
             if thread:
                 thread.join()
-        worker = self._status0_connect_thread
+        # Take the worker reference under the lock that on_connected() holds
+        # while creating and starting it, so it is never joined before start()
+        with self._status0_worker_lock:
+            worker = self._status0_connect_thread
+            self._status0_connect_thread = None
         if worker is not None and worker is not threading.current_thread():
             # Bounded: it may be inside a slow host lookup; daemon anyway
             worker.join(timeout=5.0)
-        self._status0_connect_thread = None
                 
         # Reset events and threads
         self._sensor_timer_stop_event.clear()
@@ -248,11 +257,8 @@ class BaseDevice(ABC):
         block on DNS or on getmac shelling out, and that must not stall MQTT
         processing or keepalives. Returns immediately.
         """
-        previous = self._status0_connect_thread
-        if previous is not None and previous.is_alive():
-            # A send from the previous connection is still in flight; it will
-            # either go out on this connection or be dropped as not connected.
-            return
+        # A new connection may come with a new address: re-resolve on the worker
+        self._net_info = None
 
         def _send():
             try:
@@ -260,19 +266,28 @@ class BaseDevice(ABC):
             except Exception:
                 _logger.exception("STATUS0 on connect failed")
 
-        self._status0_connect_thread = threading.Thread(
-            target=_send, name=f"{self.__class__.__name__}Status0OnConnect", daemon=True
-        )
-        self._status0_connect_thread.start()
+        with self._status0_worker_lock:
+            previous = self._status0_connect_thread
+            if previous is not None and previous.is_alive():
+                # A send from the previous connection is still in flight; it
+                # will either go out on this connection or be dropped as not
+                # connected.
+                return
+            worker = threading.Thread(
+                target=_send, name=f"{self.__class__.__name__}Status0OnConnect", daemon=True
+            )
+            worker.start()
+            self._status0_connect_thread = worker
 
     def _get_net_info(self) -> Dict[str, str]:
-        """Hostname, IP and MAC, collected once and cached.
+        """Hostname, IP and MAC, cached for NET_INFO_TTL and cleared on connect.
 
-        The lookups can block (DNS, getmac subprocesses) and the values do not
-        change while the process runs. Failures fall back to placeholders and
-        are retried on the next call.
+        The lookups can block (DNS, getmac subprocesses), so they are done on
+        the STATUS0 worker or timer thread, never on the MQTT thread, and not
+        more often than needed. Failures fall back to placeholders and are
+        retried on the next call.
         """
-        if self._net_info is not None:
+        if self._net_info is not None and time.monotonic() - self._net_info_at < NET_INFO_TTL:
             return self._net_info
         hostname = socket.gethostname()
         try:
@@ -292,6 +307,7 @@ class BaseDevice(ABC):
         }
         if ip_address is not None and mac:
             self._net_info = info
+            self._net_info_at = time.monotonic()
         return info
 
     def _start_status0_timer(self):
