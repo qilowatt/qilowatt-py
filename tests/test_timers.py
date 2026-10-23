@@ -4,7 +4,6 @@ import os
 import sys
 import threading
 import time
-
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -154,22 +153,153 @@ def test_non_numeric_interval_is_rejected():
         InverterDevice("DEV", sensor_interval="10")
 
 
-def test_status0_is_sent_at_startup_then_on_the_grid():
-    class StatusDevice(TickDevice):
-        def __init__(self):
-            super().__init__(0.5)
-            self._status0_interval = 0.05
-            self.status_ticks = []
-        def publish_status0_data(self):
-            self.status_ticks.append(time.monotonic())
+class Status0Device(TickDevice):
+    """TickDevice with a fast STATUS0 interval and recorded STATUS0 sends."""
 
-    dev = StatusDevice()
+    def __init__(self, status0_interval=0.05):
+        super().__init__(0.5)
+        self._status0_interval = status0_interval
+        self.status_sends = []            # (monotonic time, thread name)
+        self.block_send = None            # Event: block inside a send while set
+
+    def publish_status0_data(self):
+        self.status_sends.append((time.monotonic(), threading.current_thread().name))
+        if self.block_send is not None:
+            self.block_send.wait(timeout=2.0)
+
+
+def test_status0_without_a_connect_is_sent_on_the_grid_only():
+    """No immediate send any more: timers may start before the CONNACK has
+    arrived, and a message sent then would be dropped."""
+    dev = Status0Device()
     start = time.monotonic()
     dev._start_status0_timer()
-    assert _wait_for(lambda: len(dev.status_ticks) >= 3)
+    time.sleep(0.02)
+    assert dev.status_sends == []
+    assert _wait_for(lambda: len(dev.status_sends) >= 2)
     dev.stop_timers()
-    assert dev.status_ticks[0] - start < 0.03          # immediately at startup
-    assert dev.status_ticks[1] - start > 0.04          # then after one interval
+    assert dev.status_sends[0][0] - start > 0.04
+
+
+def test_on_connected_sends_status0_at_once_on_the_timer_thread():
+    dev = Status0Device(status0_interval=3600)
+    dev._start_status0_timer()
+    start = time.monotonic()
+    dev.on_connected()                                  # returns immediately
+    assert time.monotonic() - start < 0.05
+    assert _wait_for(lambda: len(dev.status_sends) == 1)
+    dev.stop_timers()
+    assert dev.status_sends[0][1].endswith("Status0Timer")
+    assert dev.status_sends[0][1] != threading.current_thread().name
+
+
+def test_connect_before_timers_start_is_served_when_they_start():
+    dev = Status0Device(status0_interval=3600)
+    dev.on_connected()                                  # CONNACK before data/timers
+    dev._start_status0_timer()
+    assert _wait_for(lambda: len(dev.status_sends) == 1)
+    dev.stop_timers()
+
+
+def test_every_reconnect_sends_status0_again():
+    dev = Status0Device(status0_interval=3600)
+    dev._start_status0_timer()
+    for n in range(1, 4):
+        dev.on_connected()
+        assert _wait_for(lambda: len(dev.status_sends) == n)
+    dev.stop_timers()
+    assert len(dev.status_sends) == 3
+
+
+def test_reconnect_during_an_in_flight_send_is_not_lost():
+    dev = Status0Device(status0_interval=3600)
+    dev.block_send = threading.Event()
+    dev._start_status0_timer()
+    dev.on_connected()
+    assert _wait_for(lambda: len(dev.status_sends) == 1)   # blocked inside the send
+    dev.on_connected()                                       # reconnect meanwhile
+    dev.block_send.set()
+    assert _wait_for(lambda: len(dev.status_sends) == 2)
+    time.sleep(0.05)
+    dev.stop_timers()
+    assert len(dev.status_sends) == 2                        # exactly one more, no burst
+
+
+def test_stop_timers_wakes_a_waiting_status0_loop_promptly():
+    dev = Status0Device(status0_interval=3600)
+    dev._start_status0_timer()
+    start = time.monotonic()
+    dev.stop_timers()
+    assert time.monotonic() - start < 1.0
+    assert dev._status0_timer_thread is None
+    assert dev.status_sends == []
+
+
+def test_status0_reports_real_endpoint_version_and_interval(monkeypatch):
+    """Broker endpoint from the client, library version from package metadata,
+    TelePeriod from the sensor interval."""
+    import qilowatt.base_device as bd
+    from unittest.mock import MagicMock, patch
+    from qilowatt.client import QilowattMQTTClient
+
+    monkeypatch.setattr(bd.socket, "gethostbyname", lambda name: "10.0.0.5")
+    monkeypatch.setattr(bd.getmac, "get_mac_address", lambda *a, **k: "aa:bb:cc:dd:ee:ff")
+    dev = TickDevice(0.5)
+    dev._sensor_interval = 10.0
+    with patch("qilowatt.client.mqtt.Client", return_value=MagicMock()):
+        QilowattMQTTClient("user-42", "pw", dev, host="broker.example", port=1883)
+
+    status = dev.get_status0_data().to_dict()
+    assert status["StatusMQT"]["MqttHost"] == "broker.example"
+    assert status["StatusMQT"]["MqttPort"] == 1883
+    assert status["StatusMQT"]["MqttUser"] == "user-42"
+    assert status["StatusFWR"]["Version"] == bd.LIBRARY_VERSION != "1.0.0"
+    assert status["StatusLOG"]["TelePeriod"] == 10
+    assert status["StatusNET"]["IPAddress"] == "10.0.0.5"
+    assert status["StatusNET"]["Mac"] == "aa:bb:cc:dd:ee:ff"
+
+
+def test_stop_arriving_between_wakeup_and_clear_is_not_lost():
+    """Regression: stop_timers() sets the stop flag and the request event. If
+    that landed after the loop's stop check but before it cleared the request,
+    the wakeup was erased and the loop slept a whole interval (an hour by
+    default) with disconnect() joined on it. Inject the stop sequence exactly
+    at the clear() to reproduce."""
+    dev = Status0Device(status0_interval=0.3)
+
+    class StopDuringClear(threading.Event):
+        def __init__(self, device):
+            super().__init__()
+            self.device = device
+            self.injected = False
+
+        def clear(self):
+            if not self.injected:
+                self.injected = True
+                # What stop_timers() does, racing this exact point
+                self.device._status0_timer_stop_event.set()
+                self.set()
+            super().clear()
+
+    dev._status0_request = StopDuringClear(dev)
+    dev._start_status0_timer()
+    dev.on_connected()                                   # wakes the loop -> clear()
+    start = time.monotonic()
+    dev._status0_timer_thread.join(timeout=2.0)
+    exited_after = time.monotonic() - start
+
+    assert not dev._status0_timer_thread.is_alive(), "loop kept running after stop"
+    assert exited_after < 0.2, f"loop took {exited_after:.2f}s to notice the stop"
+    assert dev.status_sends == []                        # no publish after stop
+
+
+def test_net_info_failure_falls_back_to_placeholders(monkeypatch):
+    import qilowatt.base_device as bd
+
+    monkeypatch.setattr(bd.socket, "gethostbyname", lambda name: (_ for _ in ()).throw(OSError("no dns")))
+    monkeypatch.setattr(bd.getmac, "get_mac_address", lambda *a, **k: None)
+    net = TickDevice(0.5).get_status0_data().to_dict()["StatusNET"]    # must not raise
+    assert net["IPAddress"] == "0.0.0.0" and net["Mac"] == ""
 
 
 def test_data_provider_is_pulled_right_before_each_publish(monkeypatch):

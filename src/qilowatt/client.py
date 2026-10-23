@@ -3,6 +3,7 @@
 import ssl
 import json
 import threading
+from collections import deque
 import logging
 import paho.mqtt.client as mqtt
 from typing import Dict, Any, Callable, List, Optional
@@ -73,7 +74,15 @@ class QilowattMQTTClient:
         self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self._connected = False
         self._subscribed = False
-        self._lock = threading.Lock()
+        # Guards connection state only. It is never held while a listener or
+        # the device hook runs: a listener may call disconnect(), which joins
+        # paho's network thread, and that thread may need this lock. Reentrant
+        # because disconnect() may be called from inside a transition.
+        self._lock = threading.RLock()
+        # Listener notifications are queued under the lock and delivered by one
+        # thread at a time with no lock held, in transition order.
+        self._pending_notifications: deque = deque()
+        self._draining_notifications = False
         self._connection_callbacks: List[Callable[[bool], None]] = []
         self._error_callbacks: List[Callable[[Exception], None]] = []
         self._auth_failures = 0
@@ -104,11 +113,10 @@ class QilowattMQTTClient:
             else:
                 _logger.warning(f"Cannot publish to {topic}: not connected")
                 # Update our internal state if Paho detected disconnection
-                if self._connected:
-                    self._connected = False
-                    self._notify_connection_change(False)
+                self._set_disconnected()
         
         self.device.set_publish_callback(publish_callback)
+        self.device.set_mqtt_info(self.host, self.port, self.mqtt_username)
 
     @property
     def connected(self) -> bool:
@@ -215,6 +223,28 @@ class QilowattMQTTClient:
         self._pending_subscribe_mid = None
         self._set_disconnected()
 
+    def _set_connected(self):
+        """Mark the client connected (once per connection), let the device send
+        what the backend expects at every (re)connect, and notify listeners.
+
+        State changes under the lock; the hook and the listeners run without
+        it. Ordering is preserved by the notification queue: a disconnect that
+        races this (possible on the subscribe-gave-up path, which runs on a
+        timer thread) is delivered after it, so listeners always see True then
+        False, never a stale True on a dead connection. A late SUBACK after
+        disconnect() is ignored (_shutdown).
+        """
+        with self._lock:
+            if self._shutdown or self._connected:
+                return
+            self._connected = True
+            self._pending_notifications.append(True)
+        try:
+            self.device.on_connected()
+        except Exception:
+            _logger.exception("Error in device on_connected hook")
+        self._drain_notifications()
+
     def _set_disconnected(self) -> bool:
         """Mark the client disconnected; notify listeners only on an actual change.
 
@@ -222,12 +252,35 @@ class QilowattMQTTClient:
         never came up, or one already torn down, from emitting a spurious
         "disconnected" notification.
         """
-        was_connected = self._connected
-        self._connected = False
-        self._subscribed = False
-        if was_connected:
-            self._notify_connection_change(False)
+        with self._lock:
+            was_connected = self._connected
+            self._connected = False
+            self._subscribed = False
+            if was_connected:
+                self._pending_notifications.append(False)
+        self._drain_notifications()
         return was_connected
+
+    def _drain_notifications(self):
+        """Deliver queued notifications in order, one thread at a time, with no
+        lock held during listener calls.
+
+        If another thread is already draining (for instance the thread whose
+        listener called disconnect(), which enqueued the False we are looking
+        at), leave the item to it: it will be delivered when that listener
+        returns, still after the True that preceded it.
+        """
+        while True:
+            with self._lock:
+                if self._draining_notifications or not self._pending_notifications:
+                    return
+                self._draining_notifications = True
+                connected = self._pending_notifications.popleft()
+            try:
+                self._notify_connection_change(connected)
+            finally:
+                with self._lock:
+                    self._draining_notifications = False
 
     def _on_message(self, client, userdata, msg):
         _logger.debug(f"Message received on {msg.topic}: {msg.payload}")
@@ -271,9 +324,7 @@ class QilowattMQTTClient:
             self._subscribe_attempts = 0
 
             # Now we're fully connected and subscribed
-            if not self._connected:
-                self._connected = True
-                self._notify_connection_change(True)
+            self._set_connected()
 
     def _on_subscribe_timeout(self):
         """Called when subscription confirmation times out."""
@@ -297,9 +348,7 @@ class QilowattMQTTClient:
             )
             # Still mark as connected so publishing works, but log the issue
             # The client can still publish, just won't receive commands
-            if not self._connected:
-                self._connected = True
-                self._notify_connection_change(True)
+            self._set_connected()
 
     def _cancel_subscribe_timer(self):
         """Cancel the subscription timeout timer."""
@@ -333,18 +382,18 @@ class QilowattMQTTClient:
 
         The lock is released before loop_stop(): it joins the network thread,
         and that thread may itself be waiting for the lock inside
-        _handle_authentication_failure(). Listeners are notified once, here,
-        and only if the client had actually been connected; paho invokes
-        _on_disconnect() synchronously from disconnect() once the loop is
-        stopped, and that path no longer notifies for an already-cleared state.
+        _handle_authentication_failure() or _on_disconnect(). Listeners are
+        notified once, with no lock held, and only if the client had actually
+        been connected; paho invokes _on_disconnect() synchronously from
+        disconnect() once the loop is stopped, and that path no longer notifies
+        for an already-cleared state.
         """
         with self._lock:
             self._shutdown = True
             self._cancel_subscribe_timer()
             self._pending_subscribe_mid = None
-            was_connected = self._connected
-            self._connected = False
-            self._subscribed = False
+        # Outside the lock: this may notify listeners
+        self._set_disconnected()
 
         try:
             self._client.loop_stop()
@@ -355,8 +404,6 @@ class QilowattMQTTClient:
         except Exception as exc:
             _logger.debug("disconnect during disconnect: %s", exc)
 
-        if was_connected:
-            self._notify_connection_change(False)
         self.device.stop_timers()
 
     def last_error(self) -> Optional[Exception]:

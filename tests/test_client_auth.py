@@ -23,6 +23,12 @@ class DummyDevice(BaseDevice):
     def __init__(self):
         super().__init__(device_id="DEVICE123")
         self.stop_called = False
+        self.status0_sent = 0
+
+    def on_connected(self):
+        # The real hook hands STATUS0 to a worker thread; count synchronously
+        # here so the client tests can assert right after the transition
+        self.status0_sent += 1
 
     def handle_command(self, payload: bytes) -> None:  # pragma: no cover - not used in tests
         pass

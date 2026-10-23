@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from unittest.mock import MagicMock, patch
 
 import paho.mqtt.client as mqtt
@@ -17,6 +18,12 @@ class DummyDevice(BaseDevice):
     def __init__(self):
         super().__init__(device_id="DEVICE123")
         self.stop_called = False
+        self.status0_sent = 0
+
+    def on_connected(self):
+        # The real hook hands STATUS0 to a worker thread; count synchronously
+        # here so the client tests can assert right after the transition
+        self.status0_sent += 1
 
     def handle_command(self, payload: bytes) -> None:
         pass
@@ -367,3 +374,196 @@ def test_disconnect_does_not_hold_lock_while_joining_network_thread(patched_envi
 
     assert joined["ok"], "network thread blocked on client._lock while loop_stop() joined it"
     assert client._shutdown is True
+
+
+def test_status0_is_sent_once_connected_not_before(patched_environment):
+    """STATUS0 goes out from the connected path, after SUBACK, so it is never
+    attempted (and dropped) before the CONNACK has arrived."""
+    mock_client = patched_environment
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    order = []
+    client.add_connection_callback(lambda c: order.append(("listener", c)))
+    device.on_connected = lambda: order.append(("status0", None))
+
+    client.connect()
+    assert order == []                                   # TCP up, no CONNACK yet
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+    assert order == []                                   # CONNACK, waiting for SUBACK
+    client._on_subscribe(mock_client, None, 1, [0], None)
+    assert order == [("status0", None), ("listener", True)]
+
+    client.disconnect()
+
+
+def test_status0_is_resent_on_every_reconnect(patched_environment):
+    mock_client = patched_environment
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+
+    client.connect()
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+    client._on_subscribe(mock_client, None, 1, [0], None)
+    assert device.status0_sent == 1
+
+    client._on_disconnect(mock_client, None, MagicMock(), 7, None)   # broker drop
+    client._on_connect(mock_client, None, MagicMock(), 0, None)      # paho reconnected
+    client._on_subscribe(mock_client, None, 1, [0], None)
+    assert device.status0_sent == 2
+
+    # A duplicate SUBACK on the same connection does not resend
+    client._on_subscribe(mock_client, None, 1, [0], None)
+    assert device.status0_sent == 2
+    client.disconnect()
+
+
+def test_status0_is_sent_when_subscribe_gives_up(patched_environment):
+    """The client marks itself connected even if subscribing fails for good;
+    STATUS0 must go out on that path too."""
+    mock_client = patched_environment
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    client.connect()
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+    for _ in range(client._max_subscribe_retries):
+        fire_pending_timers()                             # SUBACK never arrives
+    assert client.connected is True
+    assert device.status0_sent == 1
+    client.disconnect()
+
+
+def test_failing_on_connected_hook_does_not_block_connection(patched_environment):
+    mock_client = patched_environment
+    device = DummyDevice()
+    device.on_connected = lambda: (_ for _ in ()).throw(RuntimeError("no network info"))
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    states = []
+    client.add_connection_callback(states.append)
+    client.connect()
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+    client._on_subscribe(mock_client, None, 1, [0], None)
+    assert client.connected is True and states == [True]
+    client.disconnect()
+
+
+def test_disconnect_during_on_connected_never_leaves_a_stale_connected(patched_environment):
+    """Regression: the subscribe-gave-up path marks the client connected on a
+    timer thread; a broker disconnect arriving while the hook runs must not
+    end with listeners told True on a dead connection."""
+    import threading
+
+    mock_client = patched_environment
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    states = []
+    client.add_connection_callback(states.append)
+
+    hook_entered = threading.Event()
+    release_hook = threading.Event()
+
+    def slow_hook():
+        hook_entered.set()
+        assert release_hook.wait(timeout=2.0)
+
+    device.on_connected = slow_hook
+    client.connect()
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+
+    # SUBACK handled on another thread; the hook blocks inside _set_connected
+    connector = threading.Thread(target=client._on_subscribe, args=(mock_client, None, 1, [0], None))
+    connector.start()
+    assert hook_entered.wait(timeout=2.0)
+
+    # Broker drops the connection while the hook is still running
+    dropper = threading.Thread(target=client._on_disconnect, args=(mock_client, None, MagicMock(), 7, None))
+    dropper.start()
+    time.sleep(0.05)
+    release_hook.set()
+    connector.join(timeout=2.0)
+    dropper.join(timeout=2.0)
+    assert not connector.is_alive() and not dropper.is_alive()
+
+    assert states == [True, False]
+    assert client.connected is False
+    client.disconnect()
+
+
+def test_late_suback_after_disconnect_is_ignored(patched_environment):
+    mock_client = patched_environment
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    states = []
+    client.add_connection_callback(states.append)
+
+    client.connect()
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+    client.disconnect()
+    client._on_subscribe(mock_client, None, 1, [0], None)   # arrives after shutdown
+
+    assert states == []
+    assert client.connected is False
+    assert device.status0_sent == 0
+
+
+def test_listener_may_call_disconnect_from_the_callback(patched_environment):
+    """The lock is reentrant: a listener calling back into the client must not deadlock."""
+    mock_client = patched_environment
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    states = []
+
+    def listener(connected):
+        states.append(connected)
+        if connected:
+            client.disconnect()
+
+    client.add_connection_callback(listener)
+    client.connect()
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+    client._on_subscribe(mock_client, None, 1, [0], None)
+
+    assert states == [True, False]
+    assert client.connected is False and client._shutdown is True
+
+
+def test_listener_disconnect_on_subscribe_timeout_path_does_not_deadlock(patched_environment):
+    """Regression: on the subscribe-gave-up path the connected notification is
+    delivered on a timer thread. A listener that calls disconnect() makes
+    loop_stop() join the network thread; if that thread is entering
+    _on_disconnect() it needs the state lock, which must not be held across
+    the listener call."""
+    import threading
+
+    mock_client = patched_environment
+    device = DummyDevice()
+    client = QilowattMQTTClient(mqtt_username="u", mqtt_password="p", device=device)
+    states = []
+    joined = {}
+
+    def listener(connected):
+        states.append(connected)
+        if connected:
+            client.disconnect()
+
+    def loop_stop_joins_network_thread(*args, **kwargs):
+        if "done" in joined:
+            return mqtt.MQTT_ERR_SUCCESS
+        network = threading.Thread(
+            target=client._on_disconnect, args=(mock_client, None, MagicMock(), 7, None)
+        )
+        network.start()
+        network.join(timeout=2.0)
+        joined["done"] = not network.is_alive()
+        return mqtt.MQTT_ERR_SUCCESS
+
+    client.add_connection_callback(listener)
+    mock_client.loop_stop.side_effect = loop_stop_joins_network_thread
+
+    client.connect()
+    client._on_connect(mock_client, None, MagicMock(), 0, None)
+    for _ in range(client._max_subscribe_retries):
+        fire_pending_timers()                     # SUBACK never arrives -> connected anyway
+
+    assert joined.get("done") is True, "network thread blocked on the state lock while loop_stop() joined it"
+    assert states == [True, False]
+    assert client.connected is False and client._shutdown is True

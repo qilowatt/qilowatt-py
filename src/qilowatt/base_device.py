@@ -13,6 +13,12 @@ from .models import (
 import platform
 import socket
 import getmac
+from importlib.metadata import PackageNotFoundError, version as _package_version
+
+try:
+    LIBRARY_VERSION = _package_version("qilowatt")
+except PackageNotFoundError:  # running from a checkout that is not installed
+    LIBRARY_VERSION = "unknown"
 
 _logger = logging.getLogger(__name__)
 
@@ -58,6 +64,14 @@ class BaseDevice(ABC):
         self._sensor_timer_stop_event = threading.Event()
         self._state_timer_stop_event = threading.Event()
         self._status0_timer_stop_event = threading.Event()
+
+        # Set by on_connected(); the STATUS0 timer thread wakes on it and sends
+        self._status0_request = threading.Event()
+
+        # Broker endpoint, reported in STATUS0; set by the client that owns us
+        self._mqtt_host = ""
+        self._mqtt_port = 0
+        self._mqtt_user = ""
         
         self._startup_utc = datetime.utcnow()
         self._boot_count = 1
@@ -135,6 +149,7 @@ class BaseDevice(ABC):
                      self._state_timer_stop_event, 
                      self._status0_timer_stop_event]:
             event.set()
+        self._status0_request.set()   # wake the STATUS0 loop so it sees the stop
             
         for thread in [self._sensor_timer_thread, 
                       self._state_timer_thread, 
@@ -146,6 +161,7 @@ class BaseDevice(ABC):
         self._sensor_timer_stop_event.clear()
         self._state_timer_stop_event.clear()
         self._status0_timer_stop_event.clear()
+        self._status0_request.clear()
         self._sensor_timer_thread = None
         self._state_timer_thread = None
         self._status0_timer_thread = None
@@ -226,16 +242,64 @@ class BaseDevice(ABC):
         if hasattr(self, '_publish_callback'):
             self._publish_callback(self.status0_topic, status0_data.to_dict())
 
+    def on_connected(self):
+        """Called by the client once it is connected and subscribed.
+
+        Requests a STATUS0 send so the backend gets the device information
+        (StartupUTC, BootCount, network) at every connect and reconnect. The
+        send itself happens on the STATUS0 timer thread, never on the caller's
+        (paho's network thread or a timer thread), because collecting host
+        information can block on DNS or on getmac. Returns immediately. If the
+        timers are not running yet, the request is served as soon as they
+        start; if they have been stopped, it is dropped with them.
+        """
+        self._status0_request.set()
+
+    def _status0_loop(self):
+        """Send STATUS0 when requested (connect/reconnect) and otherwise every
+        status0_interval, measured from the last send."""
+        stop = self._status0_timer_stop_event
+        request = self._status0_request
+        next_at = time.monotonic() + self._status0_interval
+        while True:
+            request.wait(max(0.0, next_at - time.monotonic()))
+            # Clear before checking stop: stop_timers() sets stop then request,
+            # so a stop landing after this clear leaves its wakeup for the next
+            # iteration instead of being erased and waited out for an interval.
+            request.clear()
+            if stop.is_set():
+                return
+            try:
+                self.publish_status0_data()
+            except Exception:
+                _logger.exception("STATUS0 publish failed; will retry on the next slot")
+            next_at = time.monotonic() + self._status0_interval
+
     def _start_status0_timer(self):
-        """Start timer for sending status data: at startup, then hourly."""
+        """Start the STATUS0 thread: sends on request and hourly."""
         self._status0_timer_thread = threading.Thread(
-            target=self._run_on_grid,
-            args=(self._status0_timer_stop_event, self._status0_interval, self.publish_status0_data),
-            kwargs={"run_immediately": True},
+            target=self._status0_loop,
             name=f"{self.__class__.__name__}Status0Timer",
         )
         self._status0_timer_thread.daemon = True
         self._status0_timer_thread.start()
+
+    @staticmethod
+    def _net_info() -> Dict[str, str]:
+        """Hostname, IP and MAC. May block (DNS, getmac); only called from the
+        STATUS0 thread. Failures fall back to placeholders."""
+        hostname = socket.gethostname()
+        try:
+            ip_address = socket.gethostbyname(hostname)
+        except OSError as exc:
+            _logger.debug("Could not resolve %s: %s", hostname, exc)
+            ip_address = "0.0.0.0"
+        try:
+            mac = getmac.get_mac_address() or ""
+        except Exception as exc:  # getmac can fail in odd ways on some hosts
+            _logger.debug("Could not determine MAC address: %s", exc)
+            mac = ""
+        return {"Hostname": hostname, "IPAddress": ip_address, "Mac": mac}
 
     def get_status0_data(self) -> Status0Data:
         """Get current status data."""
@@ -255,20 +319,20 @@ class BaseDevice(ABC):
         return Status0Data(
             Status=status,
             StatusPRM=status_prm,
-            StatusFWR=StatusFWRData(Version="1.0.0", Hardware=platform.machine()),
-            StatusLOG=StatusLOGData(TelePeriod=10),
+            StatusFWR=StatusFWRData(Version=LIBRARY_VERSION, Hardware=platform.machine()),
+            StatusLOG=StatusLOGData(TelePeriod=int(self._sensor_interval)),
+            # Gateway/Subnetmask are not detected: inside a container they
+            # would describe the Docker network anyway, so static values stay
             StatusNET=StatusNETData(
-                Hostname=socket.gethostname(),
-                IPAddress=socket.gethostbyname(socket.gethostname()),
                 Gateway="192.168.1.1",
                 Subnetmask="255.255.255.0",
-                Mac=getmac.get_mac_address()
+                **self._net_info(),
             ),
             StatusMQT=StatusMQTData(
-                MqttHost="mqtt-test.qilowatt.it",
-                MqttPort=8883,
+                MqttHost=self._mqtt_host,
+                MqttPort=self._mqtt_port,
                 MqttClient="",
-                MqttUser="",
+                MqttUser=self._mqtt_user,
                 MqttClientMask="QWAPI_%06X"
             ),
             StatusTIM=StatusTIMData(
@@ -276,6 +340,12 @@ class BaseDevice(ABC):
                 Local=datetime.now().isoformat()
             )
         )
+
+    def set_mqtt_info(self, host: str, port: int, username: str = ""):
+        """Record the broker endpoint this device publishes through, for STATUS0."""
+        self._mqtt_host = host
+        self._mqtt_port = port
+        self._mqtt_user = username
 
     def set_publish_callback(self, callback: Callable[[str, Dict[str, Any]], None]):
         """Set callback for publishing data."""
