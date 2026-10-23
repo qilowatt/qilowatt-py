@@ -66,6 +66,7 @@ class BaseDevice(ABC):
         # Worker for the on-connect STATUS0 send, and cached host information
         self._status0_connect_thread: Optional[threading.Thread] = None
         self._status0_worker_lock = threading.Lock()
+        self._status0_resend_pending = False
         self._net_info: Optional[Dict[str, str]] = None
         self._net_info_at: float = 0.0
         
@@ -261,18 +262,26 @@ class BaseDevice(ABC):
         self._net_info = None
 
         def _send():
-            try:
-                self.publish_status0_data()
-            except Exception:
-                _logger.exception("STATUS0 on connect failed")
+            while True:
+                try:
+                    self.publish_status0_data()
+                except Exception:
+                    _logger.exception("STATUS0 on connect failed")
+                with self._status0_worker_lock:
+                    if not self._status0_resend_pending:
+                        return
+                    # A reconnect came in while we were sending (possibly a
+                    # dropped attempt on the old connection): send again.
+                    self._status0_resend_pending = False
 
         with self._status0_worker_lock:
             previous = self._status0_connect_thread
             if previous is not None and previous.is_alive():
-                # A send from the previous connection is still in flight; it
-                # will either go out on this connection or be dropped as not
-                # connected.
+                # A send is still in flight; have that worker send once more
+                # before it exits rather than starting a second one.
+                self._status0_resend_pending = True
                 return
+            self._status0_resend_pending = False
             worker = threading.Thread(
                 target=_send, name=f"{self.__class__.__name__}Status0OnConnect", daemon=True
             )
@@ -287,8 +296,11 @@ class BaseDevice(ABC):
         more often than needed. Failures fall back to placeholders and are
         retried on the next call.
         """
-        if self._net_info is not None and time.monotonic() - self._net_info_at < NET_INFO_TTL:
-            return self._net_info
+        # Capture once: on_connected() may clear the cache from another thread
+        # between the check and the return.
+        cached = self._net_info
+        if cached is not None and time.monotonic() - self._net_info_at < NET_INFO_TTL:
+            return cached
         hostname = socket.gethostname()
         try:
             ip_address = socket.gethostbyname(hostname)

@@ -288,6 +288,54 @@ def test_stop_timers_never_joins_an_unstarted_worker():
     assert not connector.is_alive() and not stop_thread.is_alive()
 
 
+def test_net_info_survives_invalidation_during_the_cache_check(monkeypatch):
+    """Regression: on_connected() clears the cache from another thread. Simulate
+    it landing between the None check and the return by clearing the cache from
+    inside the clock call the check makes."""
+    import qilowatt.base_device as bd
+
+    monkeypatch.setattr(bd.socket, "gethostbyname", lambda name: "10.0.0.5")
+    monkeypatch.setattr(bd.getmac, "get_mac_address", lambda *a, **k: "aa:bb:cc:dd:ee:ff")
+    dev = TickDevice(0.5)
+    dev.get_status0_data()                               # populate the cache
+
+    real_monotonic = time.monotonic
+
+    def clock_that_invalidates():
+        dev._net_info = None                             # the reconnect's clear
+        return real_monotonic()
+
+    monkeypatch.setattr(bd.time, "monotonic", clock_that_invalidates)
+    net = dev.get_status0_data().to_dict()["StatusNET"]  # raised TypeError before
+    assert net["IPAddress"] == "10.0.0.5"
+
+
+def test_reconnect_while_worker_is_finishing_still_sends_status0():
+    """Regression: a reconnect arriving while the previous worker is still
+    finishing (e.g. a dropped attempt on the old connection) must not lose
+    its STATUS0 until the hourly timer."""
+    dev = TickDevice(0.5)
+    attempts = []
+    first_attempt_started = threading.Event()
+    release_first_attempt = threading.Event()
+
+    def publish():
+        attempts.append(threading.current_thread().name)
+        if len(attempts) == 1:
+            first_attempt_started.set()
+            release_first_attempt.wait(timeout=2.0)   # "dropped" send still in flight
+
+    dev.publish_status0_data = publish
+    dev.on_connected()                                   # first connection
+    assert first_attempt_started.wait(timeout=2.0)
+    dev.on_connected()                                   # reconnect while worker busy
+    release_first_attempt.set()
+    assert _wait_for(lambda: len(attempts) == 2)
+    dev.stop_timers()
+    assert len(attempts) == 2                            # exactly one resend, no burst
+    assert len({name for name in attempts}) == 1         # same single worker
+
+
 def test_net_info_failure_falls_back_and_retries(monkeypatch):
     import qilowatt.base_device as bd
 
