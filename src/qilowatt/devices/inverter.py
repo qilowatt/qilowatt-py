@@ -48,7 +48,7 @@ class InverterDevice(BaseDevice):
     ):
         """Pull ENERGY and METRICS from `provider` right before each SENSOR publish.
 
-        This keeps the publish cadence on the device's own fixed 10 s grid while
+        This keeps the publish cadence on the device's own fixed 5 s grid while
         making every payload carry data read milliseconds before it is sent.
         Callers using a provider do not need set_energy_data / set_metrics_data.
 

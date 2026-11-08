@@ -27,7 +27,7 @@ pytest tests/test_client_auth.py::test_authentication_failure_triggers_retry
 
 - **BaseDevice** (`src/qilowatt/base_device.py`): Abstract base class for all device types. Manages:
   - MQTT topic patterns (`Q/{device_id}/SENSOR`, `Q/{device_id}/STATE`, `Q/{device_id}/STATUS0`, `Q/{device_id}/cmnd/backlog`)
-  - Automatic timer-based publishing on a fixed monotonic grid (sensor: 10s, state: 60s, status0: startup + hourly). The Qilowatt backend expects SENSOR exactly 10 s apart, so the schedule is anchored (no drift) and late slots are skipped, never burst.
+  - Automatic timer-based publishing on a fixed monotonic grid (sensor: 5s, state: 60s, status0: startup + hourly). The Qilowatt backend expects SENSOR exactly 5 s apart, so the schedule is anchored (no drift) and late slots are skipped, never burst.
   - Status0 system information collection
 
 - **Device implementations** (`src/qilowatt/devices/`):

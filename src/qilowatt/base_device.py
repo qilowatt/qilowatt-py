@@ -22,7 +22,7 @@ except PackageNotFoundError:  # running from a checkout that is not installed
 
 _logger = logging.getLogger(__name__)
 
-SENSOR_INTERVAL = 10.0   # seconds; the Qilowatt backend expects SENSOR exactly this far apart
+SENSOR_INTERVAL = 5.0    # seconds; the Qilowatt backend expects SENSOR exactly this far apart
 STATE_INTERVAL = 60.0
 STATUS0_INTERVAL = 3600.0
 
