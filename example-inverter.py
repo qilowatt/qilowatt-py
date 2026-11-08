@@ -105,7 +105,7 @@ metrics_data = MetricsData(
 
 
 def read_inverter():
-    """Called by the device on its own 10 s grid, right before each SENSOR publish.
+    """Called by the device on its own 5 s grid, right before each SENSOR publish.
 
     Read your real inverter here. Returning fresh data each time keeps every
     payload current without touching the publish cadence. (The alternative,
@@ -116,7 +116,7 @@ def read_inverter():
 
 
 # Registering a provider starts the periodic publishing
-# (SENSOR every 10 s, STATE every 60 s, STATUS0 at startup then hourly)
+# (SENSOR every 5 s, STATE every 60 s, STATUS0 at startup then hourly)
 device.set_data_provider(read_inverter)
 
 try:
